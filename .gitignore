@@ -1,0 +1,33 @@
+# Environment & Secrets
+.env
+*.env
+
+# Python (Services 02 & 03)
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Node.js (Service 01 & 04)
+node_modules/
+npm-debug.log
+
+# Android App (Mobile Frontend)
+.gradle/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+*.apk
+*.aab
+
+# IDE & OS specific
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+*.log
