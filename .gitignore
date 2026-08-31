@@ -1,6 +1,8 @@
 # Environment & Secrets
 .env
 *.env
+.env.*
+!.env.example
 
 # Python (Services 02 & 03)
 __pycache__/

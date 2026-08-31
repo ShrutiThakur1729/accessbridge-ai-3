@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  gateway-core:
+    build:
+      context: ./services/gateway-core
+      dockerfile: Dockerfile
+    container_name: gateway-core-service
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - INTENT_SAFETY_URL=http://intent-safety:8000/api/v1
+    depends_on:
+      - intent-safety
+    networks:
+      - accessbridge-net
+
+  intent-safety:
+    build:
+      context: ./services/intent-safety
+      dockerfile: Dockerfile
+    container_name: intent-safety-service
+    ports:
+      - "8000:8000"
+    networks:
+      - accessbridge-net
+
+networks:
+  accessbridge-net:
+    driver: bridge

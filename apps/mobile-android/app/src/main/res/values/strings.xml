@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">AccessBridge</string>
+    <string name="accessibility_service_description">AccessBridge AI Voice and Accessibility Assistant</string>
+</resources>
