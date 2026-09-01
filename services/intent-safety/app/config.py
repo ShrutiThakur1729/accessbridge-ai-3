@@ -1,5 +1,7 @@
 import os
 from functools import lru_cache
+from typing import Any
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +25,19 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="ignore"
     )
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug(cls, v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized in ("true", "1", "yes", "debug", "dev", "development"):
+                return True
+            if normalized in ("false", "0", "no", "release", "prod", "production"):
+                return False
+        return bool(v)
 
 
 @lru_cache

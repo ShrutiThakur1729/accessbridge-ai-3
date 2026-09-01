@@ -9,5 +9,5 @@ dotenv_1.default.config();
 exports.ENV = {
     PORT: process.env.PORT ? parseInt(process.env.PORT, 10) : 3000,
     NODE_ENV: process.env.NODE_ENV || "development",
-    INTENT_SAFETY_URL: process.env.INTENT_SAFETY_URL || "http://localhost:8000/api/v1",
+    INTENT_SAFETY_URL: process.env.INTENT_SAFETY_URL || "http://127.0.0.1:8000/api/v1",
 };

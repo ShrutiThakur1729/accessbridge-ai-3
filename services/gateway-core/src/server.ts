@@ -15,7 +15,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Performance & Security Middlewares
-app.use(compression()); // Gzip/Brotli compression for payload optimization
+app.use(compression() as any); // Gzip/Brotli compression for payload optimization
 app.use(cors());
 app.use(express.json());
 

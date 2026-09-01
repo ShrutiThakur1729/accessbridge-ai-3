@@ -88,7 +88,7 @@ export class IntentClient {
       if (controller.signal.aborted) {
         logger.info({ requestId, taskId }, "Cancelled stale request to Service 02");
       } else {
-        logger.error({ requestId, error }, "Failed to communicate with Service 02");
+        logger.error({ requestId, url, error: (error as any)?.message || String(error), cause: (error as any)?.cause }, "Failed to communicate with Service 02");
       }
       throw error;
     } finally {

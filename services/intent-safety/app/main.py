@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.schemas.request import IntentRequest
+from app.schemas.request import IntentRequest, PlannerRequest
 from app.schemas.action_plan import ActionPlanResponse, ActionType, PlanStep, WaterfallTier
 from app.services.planner_service import planner_service
 
@@ -394,54 +394,61 @@ async def health_check():
     summary="Generate Execution Plan from User Prompt",
     description="Evaluates user intent safety risk level and creates structured UI navigation steps."
 )
-async def generate_plan(request: IntentRequest) -> ActionPlanResponse:
+async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
+    user_prompt = request.user_prompt or "Continue task"
+    user_id = request.user_id or "default_user"
+    current_pkg = request.current_package_name or ""
+    screen_elements = request.compressed_elements or []
+
     if request.message_type == "USER_INTENT_FEEDBACK":
         if not request.task_id:
             raise HTTPException(status_code=400, detail="task_id is required for intent feedback.")
         try:
-            # 1. Look up existing task session to retrieve original prompt and user ID
             with task_sessions._lock:
                 session = task_sessions._sessions.get(request.task_id)
             
-            if not session:
-                raise HTTPException(status_code=404, detail="No active plan exists for this task_id.")
+            if session:
+                user_prompt = request.user_prompt or session.user_prompt or user_prompt
+                user_id = request.user_id or session.user_id or user_id
 
-            # Extract the original user intent
-            user_prompt = request.text_prompt or session.user_prompt or "Continue task"
-            user_id = request.user_id or session.user_id or "default_user"
+            # 1. Check if recovery state machine needs to handle launcher/drawer failure fallback
+            if request.action_status.upper() == "FAILED" and task_sessions._is_launcher(current_pkg):
+                if session:
+                    return task_sessions.apply_feedback(
+                        request.task_id,
+                        request.action_status,
+                        screen_elements,
+                        request.target_action,
+                        request.target_node,
+                        request.failure_reason,
+                        request.execution_attempt,
+                        request.status,
+                        current_pkg,
+                    )
 
-            # 2. Check if recovery state machine needs to handle launcher/drawer failure fallback
-            if request.action_status.upper() == "FAILED" and task_sessions._is_launcher(request.current_app_package):
-                return task_sessions.apply_feedback(
-                    request.task_id,
-                    request.action_status,
-                    request.screen_state,
-                    request.target_action,
-                    request.target_node,
-                    request.failure_reason,
-                    request.execution_attempt,
-                    request.status,
-                    request.current_app_package,
-                )
-
-            # 3. Dynamic Re-Evaluation: Call LLM on EVERY turn with current screen elements
+            # 2. Dynamic Turn Re-Evaluation with enriched screen context
             new_plan = await planner_service.generate_plan(
                 user_id=user_id,
                 user_prompt=user_prompt,
-                current_app_package=request.current_app_package,
-                screen_state=request.screen_state,  # Pass the 414 UI screen elements to LLM
+                current_app_package=current_pkg,
+                screen_state=screen_elements,
                 action_status=request.action_status, 
                 target_action=request.target_action,
                 task_id=request.task_id,
                 action_history=request.action_history,
+                active_input_focused=request.active_input_focused,
+                focused_hint=request.focused_hint,
             )
 
-            # 4. Update the active session with the newly generated action step
-            with task_sessions._lock:
-                session.plan = new_plan
-                session.current_step_index = 0
-                session.last_step_status = request.action_status.upper()
-                session.plan.current_step_index = 0
+            # 3. Update the active session with the newly generated action step
+            if session:
+                with task_sessions._lock:
+                    session.plan = new_plan
+                    session.current_step_index = 0
+                    session.last_step_status = request.action_status.upper()
+                    session.plan.current_step_index = 0
+            else:
+                task_sessions.create(request.task_id, new_plan, user_prompt, user_id)
 
             return new_plan
 
@@ -449,17 +456,18 @@ async def generate_plan(request: IntentRequest) -> ActionPlanResponse:
             raise HTTPException(status_code=404, detail="No active plan exists for this task_id.")
 
     # --- Initial Turn (Turn 1) ---
-    if not request.text_prompt:
-        raise HTTPException(status_code=400, detail="text_prompt is required for intent planning.")
+    if not request.user_prompt:
+        raise HTTPException(status_code=400, detail="user_prompt is required for intent planning.")
     
     plan = await planner_service.generate_plan(
-        user_id=request.user_id,
-        user_prompt=request.text_prompt,
-        current_app_package=request.current_app_package,
-        screen_state=request.screen_state,
+        user_id=user_id,
+        user_prompt=user_prompt,
+        current_app_package=current_pkg,
+        screen_state=screen_elements,
         action_status=request.action_status, 
         target_action=request.target_action,
         task_id=request.task_id,
         action_history=request.action_history,
+        active_input_focused=request.active_input_focused,
+        focused_hint=request.focused_hint,
     )
-    return task_sessions.create(request.task_id or plan.plan_id, plan, request.text_prompt, request.user_id)

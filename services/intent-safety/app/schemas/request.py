@@ -1,6 +1,6 @@
 from enum import Enum
-from typing import Any, List, Optional
-from pydantic import AliasChoices, BaseModel, Field
+from typing import Any, Dict, List, Optional
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class InputType(str, Enum):
@@ -8,47 +8,107 @@ class InputType(str, Enum):
     AUDIO = "AUDIO"
 
 
-class IntentRequest(BaseModel):
-    task_id: Optional[str] = Field(None, description="Client task ID used to track multi-step execution")
-    message_type: str = Field(default="USER_INTENT", description="USER_INTENT or USER_INTENT_FEEDBACK")
+class PlannerRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    task_id: Optional[str] = Field(
+        default=None,
+        description="Unique identifier for the task session",
+        validation_alias=AliasChoices("task_id", "taskId"),
+    )
+    user_prompt: Optional[str] = Field(
+        default=None,
+        description="The raw or transcribed user command",
+        validation_alias=AliasChoices("user_prompt", "text_prompt", "user_goal", "transcript", "original_intent"),
+    )
+    current_package_name: Optional[str] = Field(
+        default=None,
+        description="Active foreground application package identifier",
+        validation_alias=AliasChoices("current_package_name", "current_app_package", "current_package", "target_package"),
+    )
+    active_input_focused: bool = Field(
+        default=False,
+        description="True if an editable search or text input currently holds UI focus",
+        validation_alias=AliasChoices("active_input_focused", "activeInputFocused"),
+    )
+    focused_hint: Optional[str] = Field(
+        default=None,
+        description="Placeholder text or content description of the currently focused input element",
+        validation_alias=AliasChoices("focused_hint", "focusedHint"),
+    )
+    compressed_elements: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Cleaned, pruned UI nodes for planner evaluation",
+        validation_alias=AliasChoices("compressed_elements", "screen_state", "screenElements"),
+    )
     action_status: str = Field(
         default="INITIAL",
+        description="Status of previous action: INITIAL, SUCCESS, or FAILED",
         validation_alias=AliasChoices("action_status", "actionStatus"),
-        description="Result reported by Android for the previous step",
     )
-    status: Optional[str] = Field(None, description="Detailed Android execution status, such as PACKAGE_NOT_FOUND")
-    target_action: Optional[str] = Field(None, description="Action that produced the feedback")
-    target_node: Optional[str] = Field(None, description="Exact target used by the action")
-    failure_reason: Optional[str] = Field(None, description="Detailed on-device execution failure reason")
-    execution_attempt: int = Field(default=0, ge=0, description="Consecutive attempt number for this exact action target")
-    user_id: str = Field(..., description="Unique ID of the user requesting execution", example="usr_10293")
-    input_type: InputType = Field(default=InputType.TEXT, description="Format of incoming payload")
-    text_prompt: Optional[str] = Field(None, description="Raw text command from user", example="Send $50 to Alice on Venmo")
-    audio_base64: Optional[str] = Field(None, description="Base64 encoded audio string if input_type is AUDIO")
-    current_app_package: Optional[str] = Field(
-        None,
-        validation_alias=AliasChoices("current_app_package", "current_package"),
-        description="Active foreground app package ID",
-        example="com.venmo",
-    )
-    screen_state: List[dict[str, Any]] = Field(
+    action_history: List[Dict[str, Any]] = Field(
         default_factory=list,
-        validation_alias=AliasChoices("screen_state", "screenElements"),
-        description="Visible Android accessibility nodes",
-    )
-    action_history: List[dict[str, Any]] = Field(
-        default_factory=list,
+        description="Historical trace of executed actions for loop detection",
         validation_alias=AliasChoices("action_history", "actionHistory"),
-        description="Executed actions for this task, ordered oldest to newest",
+    )
+    message_type: str = Field(
+        default="USER_INTENT",
+        description="Protocol message type: USER_INTENT or USER_INTENT_FEEDBACK",
+        validation_alias=AliasChoices("message_type", "type"),
+    )
+    status: Optional[str] = Field(
+        default=None,
+        description="Detailed Android execution status reason",
+    )
+    target_action: Optional[str] = Field(
+        default=None,
+        description="Last attempted action primitive",
+        validation_alias=AliasChoices("target_action", "action", "action_type"),
+    )
+    target_node: Optional[str] = Field(
+        default=None,
+        description="Target node text/ID from the previous step",
+    )
+    failure_reason: Optional[str] = Field(
+        default=None,
+        description="Diagnostic explanation for on-device failure",
+        validation_alias=AliasChoices("failure_reason", "error_message", "error"),
+    )
+    execution_attempt: int = Field(
+        default=0,
+        ge=0,
+        description="Consecutive execution attempt counter",
+        validation_alias=AliasChoices("execution_attempt", "executionAttempt"),
+    )
+    user_id: str = Field(
+        default="default_user",
+        description="ID of the user making the request",
+        validation_alias=AliasChoices("user_id", "userId"),
+    )
+    input_type: str = Field(
+        default="TEXT",
+        description="Input modality: TEXT or AUDIO",
+        validation_alias=AliasChoices("input_type", "inputType"),
+    )
+    audio_base64: Optional[str] = Field(
+        default=None,
+        description="Base64 encoded voice data if applicable",
     )
 
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "user_id": "usr_9981",
-                "input_type": "TEXT",
-                "text_prompt": "Send $50 to Alice on Venmo",
-                "current_app_package": "com.venmo"
-            }
-        }
-    }
+    @property
+    def text_prompt(self) -> Optional[str]:
+        return self.user_prompt
+
+    @property
+    def current_app_package(self) -> Optional[str]:
+        return self.current_package_name
+
+    @property
+    def screen_state(self) -> List[Dict[str, Any]]:
+        return self.compressed_elements
+
+
+# Alias IntentRequest to PlannerRequest for full compatibility
+IntentRequest = PlannerRequest
+
+__all__ = ["InputType", "IntentRequest", "PlannerRequest"]

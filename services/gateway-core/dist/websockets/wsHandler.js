@@ -185,6 +185,10 @@ function setupWebSocketServer(wss) {
                 }
             }
             catch (err) {
+                if (err?.name === "AbortError") {
+                    logger_js_1.logger.info({ requestId }, "Dropped superseded planner request");
+                    return;
+                }
                 logger_js_1.logger.error({ requestId, err: err.message }, "Error processing WebSocket message or contacting AI planner");
                 if (ws.readyState === ws_1.WebSocket.OPEN) {
                     ws.send(JSON.stringify({
