@@ -1,11 +1,13 @@
 import re
 import uuid
 import json
+import os
 from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 from app.config import settings
 from app.schemas.action_plan import ActionPlanResponse, ActionType, PlanStep, RiskLevel, WaterfallTier
 from app.services.safety_service import SafetyService
+from app.services.vision_client import vision_client
 from app.utils.screen_compressor import compress_screen_state
 
 
@@ -46,6 +48,11 @@ class PlannerService:
     }
 
     SYSTEM_PROMPT = """You are an autonomous Android UI Automation Agent operating turn-by-turn.
+
+STRICT FORMAT REQUIREMENTS:
+- You MUST respond ONLY with a valid JSON object matching the requested schema.
+- Do NOT include markdown code blocks (```json), conversational text, or commentary.
+- Return raw JSON starting with '{' and ending with '}'.
 
 UNIVERSAL EXECUTION RULES (STRICT):
 
@@ -93,10 +100,39 @@ You MUST return a JSON object strictly matching the following schema:
 """
 
     def __init__(self):
+        # Read the environment at construction time so local integration tests can
+        # enable the no-cost path without reloading the settings singleton.
+        self.use_llm_mock = os.getenv(
+            "USE_LLM_MOCK", str(getattr(settings, "USE_LLM_MOCK", False))
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self.client = AsyncOpenAI(
             api_key=settings.GROQ_API_KEY,
             base_url="https://api.groq.com/openai/v1",
-        ) if getattr(settings, "GROQ_API_KEY", None) else None
+        ) if not self.use_llm_mock and getattr(settings, "GROQ_API_KEY", None) else None
+
+    @staticmethod
+    def _get_llm_mock_plan(user_prompt: str, risk_level: RiskLevel) -> ActionPlanResponse:
+        """Return a deterministic, schema-valid plan without contacting Groq."""
+        return ActionPlanResponse(
+            plan_id="plan_llm_mock",
+            user_goal=user_prompt,
+            risk_level=risk_level,
+            total_steps=1,
+            current_step_index=0,
+            is_completed=False,
+            speech_response="LLM mock enabled. Returning a local test directive.",
+            steps=[
+                PlanStep(
+                    step_id=1,
+                    action=ActionType.SCROLL,
+                    target_node=None,
+                    target_text="mock_target",
+                    tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                    requires_biometric=False,
+                    reason="Static local ActionPlanResponse for WebSocket integration testing.",
+                )
+            ],
+        )
 
     def _parse_tier_value(self, raw_tier: Any) -> int:
         if isinstance(raw_tier, int):
@@ -175,6 +211,11 @@ You MUST return a JSON object strictly matching the following schema:
             else None
         )
 
+        if current_step and current_step.action == ActionType.HARD_STOP:
+            plan.is_completed = True
+            plan.error = plan.error or "HARD_STOP"
+            return
+
         # GUARD: OPEN_APP is NEVER completed
         if current_step and current_step.action == ActionType.OPEN_APP:
             plan.is_completed = False
@@ -196,6 +237,56 @@ You MUST return a JSON object strictly matching the following schema:
                 reason="Cannot verify task completion without visible screen evidence.",
             )
 
+    @staticmethod
+    def resolve_local_action(
+        user_prompt: str,
+        screen_state: List[Dict[str, Any]],
+        risk_level: RiskLevel,
+        active_input_focused: bool,
+        focused_hint: Optional[str],
+        session_language: str,
+    ) -> Optional[ActionPlanResponse]:
+        """Approach A: resolve one unambiguous action against the visible DOM."""
+        prompt = user_prompt.strip().lower()
+        if not prompt or any(word in prompt for word in (" then ", " after ", " and then ", "next ", "navigate")):
+            return None
+
+        type_match = re.match(r"^(?:type|enter|write)\s+(.+)$", prompt, re.IGNORECASE)
+        if active_input_focused and type_match:
+            target = focused_hint or "focused input"
+            return ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
+                total_steps=1, current_step_index=0, is_completed=False,
+                session_language=session_language, execution_state="EXECUTING", approach="LOCAL_RESOLUTION",
+                speech_response=f"Entering text into {target}.",
+                steps=[PlanStep(step_id=1, action=ActionType.TYPE_TEXT, target_node=target,
+                                target_text=target, input_data=type_match.group(1),
+                                tier=WaterfallTier.TIER_3_ACCESSIBILITY, requires_biometric=False,
+                                reason="Exact focused-input command resolved locally.")],
+            )
+
+        if not re.match(r"^(?:tap|click|select|open)\b", prompt, re.IGNORECASE):
+            return None
+        matches: List[str] = []
+        for node in screen_state:
+            if not isinstance(node, dict) or not bool(node.get("is_clickable", node.get("isClickable", node.get("clickable", False)))):
+                continue
+            label = next((str(node.get(field, "")).strip() for field in ("text", "content_description", "contentDescription", "view_id", "viewId") if str(node.get(field, "")).strip()), "")
+            if len(label) >= 2 and label.lower() in prompt and label not in matches:
+                matches.append(label)
+        if len(matches) != 1:
+            return None
+        target = matches[0]
+        return ActionPlanResponse(
+            plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
+            total_steps=1, current_step_index=0, is_completed=False,
+            session_language=session_language, execution_state="EXECUTING", approach="LOCAL_RESOLUTION",
+            speech_response=f"Tapping {target}.",
+            steps=[PlanStep(step_id=1, action=ActionType.CLICK, target_node=target, target_text=target,
+                            tier=WaterfallTier.TIER_3_ACCESSIBILITY, requires_biometric=False,
+                            reason="Single exact interactive DOM target resolved locally.")],
+        )
+
     async def generate_plan(
         self,
         user_id: str,
@@ -208,9 +299,46 @@ You MUST return a JSON object strictly matching the following schema:
         action_history: Optional[List[Dict[str, Any]]] = None,
         active_input_focused: bool = False,
         focused_hint: Optional[str] = None,
+        session_language: str = "en-US",
+        screenshot_base64: Optional[str] = None,
+        vision_elements: Optional[List[Dict[str, Any]]] = None,
     ) -> ActionPlanResponse:
-        screen_state = screen_state or []
         risk_level = SafetyService.evaluate_risk(user_prompt)
+        red_reason = SafetyService.classify_red_reason(user_prompt)
+        if risk_level == RiskLevel.RED or red_reason:
+            return SafetyService.build_hard_stop_plan(user_prompt, red_reason or "generic")
+
+        screen_state = list(screen_state or [])
+        if vision_elements:
+            screen_state.extend(node for node in vision_elements if node not in screen_state)
+        clickable_present = any(
+            isinstance(node, dict)
+            and (node.get("is_clickable") or node.get("isClickable") or node.get("clickable") or node.get("tap_x") is not None)
+            for node in screen_state
+        )
+        if screenshot_base64 and (not screen_state or not clickable_present):
+            vision_payload = await vision_client.analyze(
+                screenshot_base64,
+                task_id=task_id,
+                query_text=user_prompt,
+            )
+            vision_nodes = vision_client.to_screen_state(vision_payload)
+            if vision_nodes:
+                print(f"LLM Planner: enriched DOM with {len(vision_nodes)} Service 03 coordinates.")
+                screen_state.extend(node for node in vision_nodes if node not in screen_state)
+
+        def finalize(plan: ActionPlanResponse) -> ActionPlanResponse:
+            self._attach_vision_coordinates(plan, screen_state)
+            if screen_state and any(node.get("source") == "vision" for node in screen_state):
+                plan.approach = plan.approach or "VISION_FALLBACK"
+            return plan
+
+        # This is intentionally before all planner branches. With
+        # USE_LLM_MOCK=true every request receives the same local, validated
+        # ActionPlanResponse and no Groq client is instantiated or called.
+        if self.use_llm_mock:
+            return finalize(self._get_llm_mock_plan(user_prompt, risk_level))
+
         requires_bio = SafetyService.requires_biometric_check(risk_level)
         app_launch = self._resolve_app_launch(user_prompt)
         action_history = action_history or []
@@ -218,7 +346,7 @@ You MUST return a JSON object strictly matching the following schema:
 
         # GUARD 1: Handling OPEN_APP Failure (Trigger App Drawer Fallback)
         if action_status == "FAILED" and (target_action or "").upper() == ActionType.OPEN_APP.value:
-            return ActionPlanResponse(
+            return finalize(ActionPlanResponse(
                 plan_id=f"plan_{uuid.uuid4().hex[:8]}",
                 user_goal=user_prompt,
                 risk_level=risk_level,
@@ -236,13 +364,13 @@ You MUST return a JSON object strictly matching the following schema:
                         reason="Direct intent launch failed. Swiping up to access App Drawer."
                     )
                 ]
-            )
+            ))
 
         # GUARD 2: Handling SUCCESS with 0 elements (App launched/transitioning)
         if action_status == "SUCCESS" and len(screen_state) == 0:
             is_multistep = self._is_multistep_goal(user_prompt, target_action)
             if is_multistep:
-                return ActionPlanResponse(
+                return finalize(ActionPlanResponse(
                     plan_id=f"plan_{uuid.uuid4().hex[:8]}",
                     user_goal=user_prompt,
                     risk_level=risk_level,
@@ -260,7 +388,7 @@ You MUST return a JSON object strictly matching the following schema:
                             reason="Waiting for screen nodes to populate after transition"
                         )
                     ]
-                )
+                ))
 
         # Categorize screen state into interactive_targets vs secondary_metadata
         screen_context = compress_screen_state(screen_state)
@@ -269,6 +397,12 @@ You MUST return a JSON object strictly matching the following schema:
         if focused_hint and not screen_context.get("focused_hint"):
             screen_context["focused_hint"] = focused_hint
 
+        local_plan = self.resolve_local_action(
+            user_prompt, screen_state, risk_level, active_input_focused, focused_hint, session_language
+        )
+        if local_plan:
+            return finalize(local_plan)
+
         # Fallback if no LLM client is available
         if not self.client or not getattr(settings, "GROQ_API_KEY", None):
             plan = self._get_fallback_mock_plan(user_prompt, risk_level, requires_bio, app_launch)
@@ -276,7 +410,7 @@ You MUST return a JSON object strictly matching the following schema:
                 self._replace_repeated_open_with_in_app_action(plan, user_prompt, screen_state)
             self._prioritize_focused_input(plan, user_prompt, screen_context)
             self._enforce_completion_invariants(plan, screen_state)
-            return plan
+            return finalize(plan)
 
         user_content = self._build_user_context_prompt(
             task_id=task_id,
@@ -290,19 +424,27 @@ You MUST return a JSON object strictly matching the following schema:
         )
 
         try:
-            model_name = getattr(settings, "DEFAULT_LLM_MODEL", "llama-3.3-70b-versatile")
+            model_name = "llama-3.1-8b-instant"
             completion = await self.client.chat.completions.create(
                 model=model_name,
                 messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content}
+                    {"role": "system", "content": f"{self.SYSTEM_PROMPT}\n\nLANGUAGE REQUIREMENT: Respond in BCP-47 language `{session_language}`. Keep speech_response in that language."},
+                    {"role": "user", "content": f"Respond in JSON format. User intent and screen state payload: {user_content}"}
                 ],
                 response_format={"type": "json_object"},
                 max_tokens=600,
                 temperature=0.0,
             )
 
-            raw_content = completion.choices[0].message.content
+            raw_content = completion.choices[0].message.content.strip()
+            if raw_content.startswith("```"):
+                lines = raw_content.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                raw_content = "\n".join(lines).strip()
+
             plan_dict = json.loads(raw_content)
 
             wrapped_payload = self._normalize_and_wrap_plan_dict(plan_dict, user_prompt, risk_level)
@@ -344,7 +486,7 @@ You MUST return a JSON object strictly matching the following schema:
                 elif first_action == ActionType.FINISH:
                     plan.speech_response = "Goal completed."
 
-            return plan
+            return finalize(plan)
 
         except Exception as e:
             print(f"LLM Planner warning: {e}. Falling back to default plan.")
@@ -353,7 +495,7 @@ You MUST return a JSON object strictly matching the following schema:
                 self._replace_repeated_open_with_in_app_action(plan, user_prompt, screen_state)
             self._prioritize_focused_input(plan, user_prompt, screen_context)
             self._enforce_completion_invariants(plan, screen_state)
-            return plan
+            return finalize(plan)
 
     @staticmethod
     def _app_was_opened(
@@ -573,17 +715,6 @@ Analyze the screen state in relation to the user intent. Return the complete Act
                 PlanStep(step_id=len(steps) + 1, action=ActionType.CLICK, target_node="Search", input_data=None),
                 PlanStep(step_id=len(steps) + 2, action=ActionType.TYPE_TEXT, target_node="search field", input_data=search_text),
             ])
-        if requires_bio:
-            steps.append(
-                PlanStep(
-                    step_id=len(steps) + 1,
-                    action=ActionType.CONFIRM_BIOMETRIC,
-                    target_node="pay_confirm_btn",
-                    input_data=None,
-                    tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                    requires_biometric=True,
-                )
-            )
         return ActionPlanResponse(
             plan_id=f"plan_{uuid.uuid4().hex[:8]}",
             user_goal=user_prompt,
@@ -652,6 +783,49 @@ Analyze the screen state in relation to the user intent. Return the complete Act
             step.step_id = index
         plan.total_steps = len(plan.steps)
         plan.is_completed = False
+
+    @staticmethod
+    def _attach_vision_coordinates(plan: ActionPlanResponse, screen_state: List[Dict[str, Any]]) -> None:
+        """Map Service 03 tap coordinates onto the current click/type step."""
+        vision_nodes = [
+            node
+            for node in screen_state
+            if isinstance(node, dict) and node.get("tap_x") is not None and node.get("tap_y") is not None
+        ]
+        if not vision_nodes or not plan.steps:
+            return
+
+        index = plan.current_step_index if 0 <= plan.current_step_index < len(plan.steps) else 0
+        step = plan.steps[index]
+        if step.action not in {ActionType.CLICK, ActionType.TYPE_TEXT}:
+            return
+
+        target = (step.target_text or step.target_node or "").strip().lower()
+        matched: Optional[Dict[str, Any]] = None
+        for node in vision_nodes:
+            if node.get("matched"):
+                matched = node
+                break
+        if target:
+            for node in vision_nodes:
+                haystack = " ".join(
+                    str(node.get(field) or "")
+                    for field in ("text", "content_description", "view_id", "label", "ocr_text")
+                ).lower()
+                if target in haystack or haystack in target:
+                    matched = node
+                    break
+        if matched is None and len(vision_nodes) == 1:
+            matched = vision_nodes[0]
+        if matched is None:
+            return
+
+        step.tap_x = float(matched["tap_x"])
+        step.tap_y = float(matched["tap_y"])
+        step.execution_mode = "COORDINATE"
+        step.tier = WaterfallTier.TIER_4_VISION_OCR
+        if not step.target_node:
+            step.target_node = str(matched.get("view_id") or matched.get("text") or step.target_text)
 
 
 planner_service = PlannerService()

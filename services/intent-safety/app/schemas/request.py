@@ -16,6 +16,16 @@ class PlannerRequest(BaseModel):
         description="Unique identifier for the task session",
         validation_alias=AliasChoices("task_id", "taskId"),
     )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Persistent multi-turn conversation identifier",
+        validation_alias=AliasChoices("session_id", "sessionId"),
+    )
+    session_language: Optional[str] = Field(
+        default=None,
+        description="BCP-47 language code detected by STT or supplied by the client",
+        validation_alias=AliasChoices("session_language", "sessionLanguage", "language_code", "languageCode"),
+    )
     user_prompt: Optional[str] = Field(
         default=None,
         description="The raw or transcribed user command",
@@ -93,6 +103,16 @@ class PlannerRequest(BaseModel):
     audio_base64: Optional[str] = Field(
         default=None,
         description="Base64 encoded voice data if applicable",
+    )
+    screenshot_base64: Optional[str] = Field(
+        default=None,
+        description="Base64 screenshot used when accessibility DOM parsing fails",
+        validation_alias=AliasChoices("screenshot_base64", "screenshot", "image_base64", "screen_capture"),
+    )
+    vision_elements: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Coordinate-mapped nodes already produced by Service 03",
+        validation_alias=AliasChoices("vision_elements", "vision_screen_state"),
     )
 
     @property

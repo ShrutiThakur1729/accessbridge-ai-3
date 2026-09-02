@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.IntentClient = void 0;
+exports.VisionClient = exports.IntentClient = void 0;
 const env_js_1 = require("../config/env.js");
 const logger_js_1 = require("../utils/logger.js");
 const TaskLockManager_js_1 = require("./TaskLockManager.js");
@@ -42,3 +42,38 @@ class IntentClient {
     }
 }
 exports.IntentClient = IntentClient;
+class VisionClient {
+    static async analyze(payload, requestId) {
+        const baseUrl = String(env_js_1.ENV.VISION_PERCEPTION_URL || "").replace(/\/$/, "");
+        if (!baseUrl || !payload.screenshot_base64) {
+            return null;
+        }
+        const url = baseUrl.endsWith("/analyze") ? baseUrl : `${baseUrl}/analyze`;
+        logger_js_1.logger.info({ requestId, url, taskId: payload.task_id }, "Routing fallback screenshot to Service 03");
+        try {
+            const response = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Request-ID": requestId },
+                body: JSON.stringify({
+                    task_id: payload.task_id,
+                    query_text: payload.query_text,
+                    screenshot_base64: payload.screenshot_base64,
+                    image_base64: payload.screenshot_base64,
+                }),
+            });
+            if (!response.ok) {
+                const errorText = await response.text();
+                logger_js_1.logger.warn({ requestId, status: response.status, errorText }, "Service 03 analyze failed");
+                return null;
+            }
+            const data = (await response.json());
+            logger_js_1.logger.info({ requestId, taskId: payload.task_id, engine: data?.engine, detections: (data?.elements || []).length }, "Service 03 returned coordinate payload");
+            return data;
+        }
+        catch (error) {
+            logger_js_1.logger.warn({ requestId, error: error?.message || String(error) }, "Service 03 unreachable");
+            return null;
+        }
+    }
+}
+exports.VisionClient = VisionClient;

@@ -6,8 +6,94 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.setupWebSocketServer = setupWebSocketServer;
 const ws_1 = require("ws");
 const crypto_1 = __importDefault(require("crypto"));
+const env_js_1 = require("../config/env.js");
 const logger_js_1 = require("../utils/logger.js");
 const intentClient_js_1 = require("../services/intentClient.js");
+const sttClient_js_1 = require("../services/sttClient.js");
+class HybridPayloadError extends Error {
+    code;
+    constructor(code, message) {
+        super(message);
+        this.code = code;
+        this.name = "HybridPayloadError";
+    }
+}
+function isHybridStart(message) {
+    return ["HYBRID_AUDIO_START", "AUDIO_STREAM_START"].includes(String(message.message_type || message.type || "").toUpperCase());
+}
+function isHybridEnd(message) {
+    return ["HYBRID_AUDIO_END", "AUDIO_STREAM_END"].includes(String(message.message_type || message.type || "").toUpperCase());
+}
+function screenshotFrom(message) {
+    const nested = message.screen_state && typeof message.screen_state === "object" && !Array.isArray(message.screen_state)
+        ? message.screen_state
+        : null;
+    const raw = message.screenshot_base64 ||
+        message.screenshot ||
+        message.image_base64 ||
+        message.screen_capture ||
+        nested?.screenshot_base64 ||
+        "";
+    return String(raw).replace(/^data:[^;]+;base64,/, "").trim();
+}
+function visionNodesFrom(payload) {
+    if (!payload)
+        return [];
+    if (Array.isArray(payload.screen_state) && payload.screen_state.length > 0) {
+        return payload.screen_state;
+    }
+    return (payload.elements || []).map((element, index) => ({
+        text: element.ocr_text || element.label || `control_${index + 1}`,
+        content_description: element.label || "",
+        view_id: element.element_id || `vis_${index + 1}`,
+        class_name: "vision.DetectedControl",
+        is_clickable: true,
+        source: "vision",
+        tap_x: element.tap_x,
+        tap_y: element.tap_y,
+        confidence: element.confidence,
+        matched: Boolean(element.matched) || element.element_id === payload.matched_element_id,
+    }));
+}
+function nestedScreenObject(message) {
+    const raw = message.screen_state;
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+}
+function extractScreenNodes(message) {
+    const nested = nestedScreenObject(message);
+    const candidates = [
+        message.screenElements,
+        Array.isArray(message.screen_state) ? message.screen_state : null,
+        nested?.screenElements,
+        nested?.screen_state,
+    ];
+    const nodes = candidates.find((value) => Array.isArray(value));
+    return nodes || [];
+}
+function isActionableNode(node) {
+    if (!node || typeof node !== "object")
+        return false;
+    return Boolean(node.is_clickable ||
+        node.isClickable ||
+        node.clickable ||
+        node.is_editable ||
+        node.isEditable ||
+        (node.tap_x != null && node.tap_y != null));
+}
+function shouldRouteToVision(nodes, screenshot, message) {
+    if (!screenshot)
+        return false;
+    const status = String(message.status || message.failure_reason || message.error_message || "").toUpperCase();
+    const accessibilityFailed = ["NODE_MISSING", "NOT_CLICKABLE", "EMPTY_UI_STATE", "OFF_SCREEN", "ACTION_FAILED"].some((code) => status.includes(code));
+    return nodes.length === 0 || !nodes.some(isActionableNode) || accessibilityFailed;
+}
+function hybridDom(message) {
+    return extractScreenNodes(message);
+}
+function normalizeLanguage(value, fallback = "en-US") {
+    const language = String(value || "").trim();
+    return /^[a-z]{2,3}(?:-[A-Za-z]{2,4})?$/.test(language) ? language : fallback;
+}
 function actionTypeFor(step) {
     return step ? (step.action_type || step.action) : "FINISH";
 }
@@ -26,7 +112,7 @@ function compressScreenState(screenState) {
         const viewId = String(node.view_id || node.viewId || "").toLowerCase();
         const text = String(node.text || node.content_description || node.contentDescription || "").trim();
         // Retain actionable, editable, or nodes with meaningful text
-        const isClickable = Boolean(node.is_clickable || node.isClickable || node.clickable);
+        const isClickable = Boolean(node.is_clickable || node.isClickable || node.clickable || (node.tap_x != null && node.tap_y != null));
         const isEditable = Boolean(node.is_editable || node.isEditable || node.editable);
         // Never prune actionable controls, including one-character controls and
         // in-app fields that only expose a view ID.
@@ -54,6 +140,13 @@ function compressScreenState(screenState) {
             cleanNode.is_clickable = true;
         if (node.is_editable || node.isEditable || node.editable)
             cleanNode.is_editable = true;
+        if (node.source)
+            cleanNode.source = node.source;
+        if (node.tap_x != null && node.tap_y != null) {
+            cleanNode.tap_x = node.tap_x;
+            cleanNode.tap_y = node.tap_y;
+            cleanNode.is_clickable = true;
+        }
         return cleanNode;
     });
     return filtered;
@@ -86,12 +179,115 @@ function setupWebSocketServer(wss) {
             ws.isAlive = true;
         });
         logger_js_1.logger.info({ clientId, clientIp }, "Client connected via WebSocket");
-        ws.on("message", async (message) => {
+        // Binary WebSocket frames have no task metadata. The Android client sends a
+        // HYBRID_AUDIO_START JSON frame first, then chunks, then HYBRID_AUDIO_END.
+        // One recorder is active per accessibility session, so one pending stream per
+        // socket is intentional and prevents chunks from crossing task boundaries.
+        let pendingHybridAudio;
+        const sendHybridFallback = (taskId, error) => {
+            if (ws.readyState === ws_1.WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    task_id: taskId || "",
+                    speech_response: error.message,
+                    action_type: "FINISH",
+                    target_text: "",
+                    package_name: "",
+                    text_to_type: "",
+                    scroll_direction: "",
+                    execution_mode: "ACCESSIBILITY",
+                    language_code: "en-US",
+                    execution_state: "ERROR",
+                    approach: "",
+                    error: error.code,
+                    is_completed: true,
+                }));
+            }
+        };
+        ws.on("message", async (message, isBinary) => {
             const requestId = `req_${crypto_1.default.randomUUID().slice(0, 8)}`;
+            let hybridTaskId;
             try {
-                const parsedMessage = JSON.parse(message.toString());
+                if (isBinary) {
+                    if (!pendingHybridAudio) {
+                        throw new HybridPayloadError("AUDIO_CORRUPT", "Received audio data before hybrid audio metadata.");
+                    }
+                    const chunk = Buffer.from(message);
+                    if (pendingHybridAudio.byteLength + chunk.length > env_js_1.ENV.MAX_AUDIO_BYTES) {
+                        const taskId = pendingHybridAudio.taskId;
+                        pendingHybridAudio = undefined;
+                        hybridTaskId = taskId;
+                        throw new HybridPayloadError("AUDIO_CORRUPT", "Voice recording exceeds the allowed audio size.");
+                    }
+                    pendingHybridAudio.chunks.push(chunk);
+                    pendingHybridAudio.byteLength += chunk.length;
+                    return;
+                }
+                let parsedMessage = JSON.parse(message.toString());
+                let audioBuffer;
+                let hybridPayload = false;
+                if (isHybridStart(parsedMessage)) {
+                    const taskId = String(parsedMessage.task_id || `task_${crypto_1.default.randomUUID().slice(0, 8)}`);
+                    hybridTaskId = taskId;
+                    const dom = hybridDom(parsedMessage);
+                    if (dom.length === 0 && !screenshotFrom(parsedMessage)) {
+                        throw new HybridPayloadError("DOM_EMPTY", "No screen DOM was supplied with the voice request.");
+                    }
+                    pendingHybridAudio = {
+                        taskId,
+                        metadata: { ...parsedMessage, task_id: taskId },
+                        chunks: [],
+                        byteLength: 0,
+                        mimeType: String(parsedMessage.audio_mime_type || parsedMessage.mime_type || "audio/webm"),
+                    };
+                    return;
+                }
+                if (isHybridEnd(parsedMessage)) {
+                    if (!pendingHybridAudio) {
+                        throw new HybridPayloadError("AUDIO_CORRUPT", "Received hybrid audio completion without an active audio stream.");
+                    }
+                    if (parsedMessage.task_id && String(parsedMessage.task_id) !== pendingHybridAudio.taskId) {
+                        throw new HybridPayloadError("AUDIO_CORRUPT", "Hybrid audio completion did not match the active task.");
+                    }
+                    parsedMessage = { ...pendingHybridAudio.metadata, ...parsedMessage, task_id: pendingHybridAudio.taskId };
+                    hybridTaskId = pendingHybridAudio.taskId;
+                    audioBuffer = Buffer.concat(pendingHybridAudio.chunks, pendingHybridAudio.byteLength);
+                    parsedMessage.audio_mime_type = pendingHybridAudio.mimeType;
+                    pendingHybridAudio = undefined;
+                    hybridPayload = true;
+                }
+                else if (typeof parsedMessage.audio_base64 === "string") {
+                    // Also support a single JSON frame for short recordings/files.
+                    const rawBase64 = parsedMessage.audio_base64.replace(/^data:[^;]+;base64,/, "").trim();
+                    if (!rawBase64 || !/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64)) {
+                        throw new HybridPayloadError("AUDIO_CORRUPT", "Voice payload is not valid base64 audio.");
+                    }
+                    audioBuffer = Buffer.from(rawBase64, "base64");
+                    if (audioBuffer.length > env_js_1.ENV.MAX_AUDIO_BYTES) {
+                        throw new HybridPayloadError("AUDIO_CORRUPT", "Voice recording exceeds the allowed audio size.");
+                    }
+                    hybridPayload = true;
+                }
+                if (hybridPayload && hybridDom(parsedMessage).length === 0 && !screenshotFrom(parsedMessage)) {
+                    throw new HybridPayloadError("DOM_EMPTY", "No screen DOM was supplied with the voice request.");
+                }
+                if (audioBuffer) {
+                    try {
+                        const sttResult = await sttClient_js_1.SttClient.transcribe(audioBuffer, String(parsedMessage.audio_mime_type || parsedMessage.mime_type || "audio/webm"));
+                        parsedMessage.transcript = sttResult.transcript;
+                        // Explicit client metadata wins when supplied; otherwise preserve the
+                        // language detected by STT for the entire session.
+                        parsedMessage.session_language = parsedMessage.session_language || parsedMessage.language_code || sttResult.language;
+                    }
+                    catch (error) {
+                        if (error instanceof sttClient_js_1.SttError) {
+                            throw new HybridPayloadError(error.code, error.message);
+                        }
+                        throw error;
+                    }
+                }
                 // Extract multi-turn protocol fields sent from Android
                 const taskId = parsedMessage.task_id || `task_${crypto_1.default.randomUUID().slice(0, 8)}`;
+                const sessionId = String(parsedMessage.session_id || parsedMessage.sessionId || taskId);
                 const messageType = parsedMessage.message_type === "USER_INTENT_FEEDBACK" || parsedMessage.type === "USER_INTENT_FEEDBACK"
                     ? "USER_INTENT_FEEDBACK"
                     : "USER_INTENT";
@@ -99,18 +295,39 @@ function setupWebSocketServer(wss) {
                 const storedContext = taskContexts.get(taskId);
                 const transcript = providedTranscript || storedContext?.transcript || "";
                 const userId = parsedMessage.user_id || storedContext?.userId || "default_user";
+                const sessionLanguage = normalizeLanguage(parsedMessage.session_language || parsedMessage.sessionLanguage || parsedMessage.language_code, storedContext?.sessionLanguage || "en-US");
                 const taskContext = storedContext || {
                     transcript: "",
                     userId,
+                    sessionId,
+                    sessionLanguage,
                     actionHistory: [],
                 };
                 if (providedTranscript) {
                     taskContext.transcript = providedTranscript;
                     taskContext.userId = userId;
                 }
-                const screenState = parsedMessage.screen_state || parsedMessage.screenElements || [];
+                taskContext.sessionId = sessionId;
+                taskContext.sessionLanguage = sessionLanguage;
+                const nestedScreen = nestedScreenObject(parsedMessage);
+                const screenState = extractScreenNodes(parsedMessage);
                 const actionStatus = parsedMessage.action_status || parsedMessage.actionStatus || "INITIAL";
-                const currentAppPackage = parsedMessage.current_app_package || parsedMessage.current_package || "";
+                const currentPackageName = String(parsedMessage.current_package_name ||
+                    parsedMessage.current_app_package ||
+                    parsedMessage.current_package ||
+                    nestedScreen?.current_package_name ||
+                    nestedScreen?.current_app_package ||
+                    "").trim();
+                const activeInputFocused = Boolean(parsedMessage.active_input_focused ??
+                    parsedMessage.activeInputFocused ??
+                    nestedScreen?.active_input_focused ??
+                    nestedScreen?.activeInputFocused ??
+                    false);
+                const focusedHint = String(parsedMessage.focused_hint ||
+                    parsedMessage.focusedHint ||
+                    nestedScreen?.focused_hint ||
+                    nestedScreen?.focusedHint ||
+                    "").trim();
                 const originalElementsCount = Array.isArray(screenState) ? screenState.length : 0;
                 const executedAction = parsedMessage.target_action || parsedMessage.action_type || parsedMessage.action;
                 if (executedAction && actionStatus.toUpperCase() !== "INITIAL") {
@@ -123,18 +340,30 @@ function setupWebSocketServer(wss) {
                 taskContexts.set(taskId, taskContext);
                 // Compress screen state nodes before forwarding to Python Service 02
                 const compressedScreenState = compressScreenState(screenState);
+                const screenshotBase64 = screenshotFrom(parsedMessage);
+                let visionElements = Array.isArray(parsedMessage.vision_elements) ? parsedMessage.vision_elements : [];
+                if (shouldRouteToVision(compressedScreenState, screenshotBase64, parsedMessage)) {
+                    const visionPayload = await intentClient_js_1.VisionClient.analyze({ screenshot_base64: screenshotBase64, task_id: taskId, query_text: transcript }, requestId);
+                    visionElements = visionNodesFrom(visionPayload);
+                }
                 logger_js_1.logger.info({
                     requestId,
                     taskId,
+                    sessionId,
+                    sessionLanguage,
                     actionStatus,
                     transcriptLength: transcript.length,
                     originalElementsCount,
                     compressedElementsCount: compressedScreenState.length,
+                    visionElementsCount: visionElements.length,
+                    screenshotPresent: Boolean(screenshotBase64),
                 }, "Compressed screen state and querying Python AI Planner");
                 // Call Service 02 (Python FastAPI Planner) via IntentClient
                 const aiPlan = await intentClient_js_1.IntentClient.evaluateIntent({
                     user_id: userId,
                     task_id: taskId,
+                    session_id: sessionId,
+                    session_language: sessionLanguage,
                     message_type: messageType,
                     action_status: actionStatus,
                     status: parsedMessage.status || "",
@@ -144,8 +373,15 @@ function setupWebSocketServer(wss) {
                     execution_attempt: Number(parsedMessage.execution_attempt || 0),
                     input_type: "TEXT",
                     text_prompt: transcript,
-                    current_app_package: currentAppPackage,
+                    // Send the canonical fields used by the Phase 1 planner schema while
+                    // retaining the legacy package name for older Service 02 deployments.
+                    current_package_name: currentPackageName,
+                    current_app_package: currentPackageName,
+                    active_input_focused: activeInputFocused,
+                    focused_hint: focusedHint,
                     screen_state: compressedScreenState,
+                    screenshot_base64: screenshotBase64 || undefined,
+                    vision_elements: visionElements,
                     action_history: taskContext.actionHistory,
                 }, requestId);
                 // Map the current Python planner step to the Android action protocol format
@@ -158,8 +394,13 @@ function setupWebSocketServer(wss) {
                     logger_js_1.logger.warn({ requestId, taskId, actionStatus, originalElementsCount }, "[Gateway-Core] Intercepted invalid premature completion from Planner.");
                 }
                 const actionType = actionTypeFor(currentStep);
+                const isHardStop = actionType === "HARD_STOP" || aiPlan.error === "HARD_STOP";
                 const responsePayload = {
                     task_id: taskId,
+                    session_id: sessionId,
+                    language_code: normalizeLanguage(aiPlan.session_language, sessionLanguage),
+                    execution_state: isHardStop ? "ERROR" : aiPlan.execution_state || "EXECUTING",
+                    approach: isHardStop ? "SAFETY_INTERCEPT" : aiPlan.approach || "SERVER_REPLANNING",
                     speech_response: prematureCompletion
                         ? "Target application could not be launched."
                         : aiPlan.speech_response ||
@@ -173,8 +414,10 @@ function setupWebSocketServer(wss) {
                     scroll_direction: currentStep?.scroll_direction || "",
                     execution_mode: currentStep?.execution_mode ||
                         (currentStep && currentStep.action === "OPEN_APP" ? "SYSTEM_INTENT" : "ACCESSIBILITY"),
-                    error: aiPlan.error || "",
-                    is_completed: !prematureCompletion && actionType === "FINISH" && aiPlan.is_completed === true,
+                    error: isHardStop ? "HARD_STOP" : aiPlan.error || "",
+                    is_completed: isHardStop || (!prematureCompletion && actionType === "FINISH" && aiPlan.is_completed === true),
+                    tap_x: currentStep?.tap_x,
+                    tap_y: currentStep?.tap_y,
                 };
                 if (ws.readyState === ws_1.WebSocket.OPEN) {
                     ws.send(JSON.stringify(responsePayload));
@@ -185,6 +428,11 @@ function setupWebSocketServer(wss) {
                 }
             }
             catch (err) {
+                if (err instanceof HybridPayloadError) {
+                    logger_js_1.logger.warn({ requestId, taskId: hybridTaskId, error: err.code }, "Rejected hybrid voice/DOM payload");
+                    sendHybridFallback(hybridTaskId, err);
+                    return;
+                }
                 if (err?.name === "AbortError") {
                     logger_js_1.logger.info({ requestId }, "Dropped superseded planner request");
                     return;
@@ -198,6 +446,9 @@ function setupWebSocketServer(wss) {
                         package_name: "",
                         text_to_type: "",
                         scroll_direction: "",
+                        language_code: "en-US",
+                        execution_state: "ERROR",
+                        approach: "",
                         is_completed: true,
                     }));
                 }

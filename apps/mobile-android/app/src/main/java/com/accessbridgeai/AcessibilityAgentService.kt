@@ -4,19 +4,25 @@ import android.accessibilityservice.AccessibilityButtonController
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.graphics.Rect
+import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.*
+import java.io.ByteArrayOutputStream
+import kotlin.coroutines.resume
 
 class AccessibilityAgentService : AccessibilityService() {
 
@@ -36,6 +42,11 @@ class AccessibilityAgentService : AccessibilityService() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
     private var windowChangeDeferred: CompletableDeferred<Unit>? = null
     private val executionAttempts = mutableMapOf<String, Int>()
+
+    // Phase 1 Universal DOM Extraction metadata
+    private var isInputFocusedInCapture = false
+    private var focusedHintInCapture: String? = null
+    private var activePackageInCapture: String? = null
 
     data class ActionResult(
         val success: Boolean,
@@ -147,7 +158,30 @@ class AccessibilityAgentService : AccessibilityService() {
     }
 
     fun sendPayload(payload: JSONObject) {
-        webSocketManager?.sendPayload(payload)
+        val success = webSocketManager?.sendPayload(payload) ?: false
+        if (success) {
+            Log.d("AccessibilityAgent", "Successfully queued payload for transmission.")
+        } else {
+            Log.e("AccessibilityAgent", "Failed to send payload via WebSocket. Connection state: ${_connectionStatus.value}")
+        }
+    }
+
+    /**
+     * LOCAL DEBUG: Prints the JSON payload matching the WebSocket format directly to Logcat.
+     * Allows local verification of DOM extraction and metadata enrichment.
+     */
+    fun testOfflineDomCompression() {
+        serviceScope.launch {
+            Log.d("AccessibilityAgent", "Running offline Phase 1 DOM extraction test...")
+            val screenState = captureScreenStateWithRetry()
+            val payload = JSONObject().apply {
+                put("type", "OFFLINE_TEST")
+                put("task_id", "test-offline-task")
+                put("timestamp", System.currentTimeMillis())
+            }
+            attachScreenContext(payload, screenState)
+            Log.d("AccessibilityAgent", "OFFLINE_MOCK_PAYLOAD:\n${payload.toString(2)}")
+        }
     }
 
     private fun sendTranscriptToBackend(transcript: String) {
@@ -163,10 +197,10 @@ class AccessibilityAgentService : AccessibilityService() {
                 put("task_id", taskId)
                 put("transcript", transcript)
                 put("timestamp", System.currentTimeMillis())
-                put("screen_state", screenState)
             }
+            attachScreenContext(payload, screenState)
             Log.d("AccessibilityAgent", "Sending Payload: ${payload.toString(2)}")
-            webSocketManager?.sendPayload(payload)
+            sendPayload(payload)
         }
     }
 
@@ -178,8 +212,12 @@ class AccessibilityAgentService : AccessibilityService() {
             val packageName = json.optString("package_name")
             val textToType = json.optString("text_to_type")
             val scrollDirection = json.optString("scroll_direction")
+            val executionMode = json.optString("execution_mode")
+            val error = json.optString("error")
             val isCompleted = json.optBoolean("is_completed", false)
             val taskId = json.optString("task_id")
+            val tapX = if (json.has("tap_x") && !json.isNull("tap_x")) json.optDouble("tap_x") else Double.NaN
+            val tapY = if (json.has("tap_y") && !json.isNull("tap_y")) json.optDouble("tap_y") else Double.NaN
 
             if (taskId.isNotEmpty()) {
                 currentTaskId = taskId
@@ -192,8 +230,8 @@ class AccessibilityAgentService : AccessibilityService() {
                 voiceAssistantManager?.speak(speechResponse)
             }
 
-            if (actionType == "FINISH" || isCompleted) {
-                Log.d("AccessibilityAgent", "Task finished.")
+            if (actionType == "FINISH" || actionType == "HARD_STOP" || error == "HARD_STOP" || isCompleted) {
+                Log.d("AccessibilityAgent", "Task finished or safety intercept: $actionType error=$error")
                 return
             }
 
@@ -208,8 +246,13 @@ class AccessibilityAgentService : AccessibilityService() {
                     }
                 }
                 "CLICK" -> {
-                    actionResult = if (!targetText.isNullOrBlank()) clickElementByText(targetText) 
-                                 else ActionResult(false, "INVALID_ARGUMENT", "Target text is missing for CLICK.")
+                    actionResult = when {
+                        executionMode == "COORDINATE" && !tapX.isNaN() && !tapY.isNaN() ->
+                            clickAtNormalized(tapX, tapY)
+                        !targetText.isNullOrBlank() -> clickElementByText(targetText)
+                        !tapX.isNaN() && !tapY.isNaN() -> clickAtNormalized(tapX, tapY)
+                        else -> ActionResult(false, "INVALID_ARGUMENT", "Target text is missing for CLICK.")
+                    }
                 }
                 "TYPE_TEXT" -> {
                     actionResult = if (!textToType.isNullOrBlank()) typeTextIntoFocusedNode(textToType)
@@ -465,6 +508,15 @@ class AccessibilityAgentService : AccessibilityService() {
         }
         
         return success
+    }
+
+    private fun clickAtNormalized(normalizedX: Double, normalizedY: Double): ActionResult {
+        val metrics = resources.displayMetrics
+        val x = (normalizedX.coerceIn(0.0, 1.0) * metrics.widthPixels).toFloat()
+        val y = (normalizedY.coerceIn(0.0, 1.0) * metrics.heightPixels).toFloat()
+        Log.d("AccessibilityAgent", "Dispatching Service 03 coordinate tap at ($x, $y)")
+        val success = dispatchClickAt(x, y)
+        return ActionResult(success, if (success) "SUCCESS" else "GESTURE_FAILED")
     }
 
     // 2. Launch external apps safely
@@ -786,7 +838,7 @@ class AccessibilityAgentService : AccessibilityService() {
                 delay(600)
             }
             
-            // Scrape screen state after the specified settlement delay
+            // Scrape enriched screen state after the specified settlement delay
             val screenState = captureScreenStateWithRetry()
             
             var finalSuccess = result.success
@@ -811,8 +863,9 @@ class AccessibilityAgentService : AccessibilityService() {
                 }
             }
 
-            // Ensure we only send SUCCESS if we actually have active screen elements
-            if (!immediate && finalSuccess && screenState.length() == 0) {
+            // Ensure we only send SUCCESS if we actually have active screen elements in Phase 1 structure
+            val elements = screenState.optJSONArray("screenElements")
+            if (!immediate && finalSuccess && (elements == null || elements.length() == 0)) {
                 finalSuccess = false
                 finalStatus = "EMPTY_UI_STATE"
                 finalErrorMessage = "Action appeared successful but no UI elements were captured after settlement."
@@ -838,90 +891,217 @@ class AccessibilityAgentService : AccessibilityService() {
                     put("error_message", finalErrorMessage ?: finalStatus)
                 }
 
-                put("screen_state", screenState)
                 put("timestamp", System.currentTimeMillis())
             }
+            attachScreenContext(payload, screenState)
             
             Log.d("AccessibilityAgent", "Dispatching Feedback Loop: ${payload.toString(2)}")
-            webSocketManager?.sendPayload(payload)
+            val sendSuccess = webSocketManager?.sendPayload(payload) ?: false
+            if (!sendSuccess) {
+                Log.e("AccessibilityAgent", "CRITICAL: Feedback payload failed to send. Task ID: $capturedTaskId")
+            }
         }
     }
 
     // --- Screen State Extraction (Task 5 Phase 1 - Robustified) ---
 
-    private suspend fun captureScreenStateWithRetry(): JSONArray {
+    private suspend fun captureScreenStateWithRetry(): JSONObject {
         var retries = 5 // Increased retries to handle slow-loading apps or animations
-        var result = JSONArray()
+        var finalResult = JSONObject()
         
         // Initial debounce/delay for UI settlement after action
-        delay(400)
+        delay(500)
 
         while (retries > 0) {
             val currentBatch = JSONArray()
-            val windows = windows
-            var foundNodes = false
+            // Reset metadata for each attempt
+            isInputFocusedInCapture = false
+            focusedHintInCapture = null
+            activePackageInCapture = null
+
+            // Prioritize rootInActiveWindow for the main app content
+            val activeRoot = rootInActiveWindow
+            val windowsList = windows
             
-            if (windows.isNotEmpty()) {
-                for (window in windows) {
-                    val root = window.root
-                    if (root != null) {
-                        if (root.childCount > 0) {
-                            traverseAndExtract(root, currentBatch)
-                            foundNodes = true
-                        }
-                        root.recycle()
-                    }
+            var nodesCaptured = 0
+
+            if (activeRoot != null) {
+                val pkg = activeRoot.packageName?.toString() ?: ""
+                if (!pkg.contains("com.android.systemui", ignoreCase = true)) {
+                    traverseAndExtract(activeRoot, currentBatch)
+                    nodesCaptured = currentBatch.length()
                 }
-            } else {
-                rootInActiveWindow?.let { root ->
-                    if (root.childCount > 0) {
-                        traverseAndExtract(root, currentBatch)
-                        foundNodes = true
+                activeRoot.recycle()
+            }
+
+            // If active root didn't give us much, or to be thorough, check other windows
+            if (nodesCaptured == 0 && windowsList.isNotEmpty()) {
+                for (window in windowsList) {
+                    val root = window.root ?: continue
+                    val pkg = root.packageName?.toString() ?: ""
+                    if (pkg.contains("com.android.systemui", ignoreCase = true)) {
+                        root.recycle()
+                        continue
                     }
+                    traverseAndExtract(root, currentBatch)
                     root.recycle()
                 }
             }
 
-            if (foundNodes && currentBatch.length() > 0) {
-                result = currentBatch
+            if (currentBatch.length() > 0) {
+                finalResult = JSONObject().apply {
+                    put("screenElements", currentBatch)
+                    put("current_package_name", activePackageInCapture ?: "")
+                    put("active_input_focused", isInputFocusedInCapture)
+                    put("focused_hint", focusedHintInCapture ?: JSONObject.NULL)
+                }
+                Log.d("AccessibilityAgent", "Successfully captured ${currentBatch.length()} elements.")
                 break
             }
             
             Log.d("AccessibilityAgent", "UI extraction returned 0 elements, retrying... ($retries left)")
-            delay(300) // Increased poll interval for stability
+            delay(400) // Increased poll interval for stability
             retries--
         }
-        return result
+
+        // Return empty structure if all retries fail
+        if (finalResult.length() == 0) {
+            Log.w("AccessibilityAgent", "Failed to capture any UI elements after all retries.")
+            finalResult = JSONObject().apply {
+                put("screenElements", JSONArray())
+                put("current_package_name", "")
+                put("active_input_focused", false)
+                put("focused_hint", JSONObject.NULL)
+            }
+        }
+        
+        return finalResult
     }
 
-    private fun traverseAndExtract(node: AccessibilityNodeInfo, array: JSONArray) {
-        val nodeObj = JSONObject().apply {
-            put("text", node.text?.toString() ?: "")
-            put("content_description", node.contentDescription?.toString() ?: "")
-            put("view_id", node.viewIdResourceName ?: "")
-            put("class_name", node.className?.toString() ?: "")
-            put("package_name", node.packageName?.toString() ?: "")
-            put("is_clickable", node.isClickable)
-            put("is_editable", node.isEditable)
-            put("is_focused", node.isFocused)
-            put("is_scrollable", node.isScrollable)
-            put("is_visible", node.isVisibleToUser)
-            put("is_enabled", node.isEnabled)
-            put("is_checked", node.isChecked)
-            put("is_selected", node.isSelected)
-            
-            val bounds = Rect()
-            node.getBoundsInScreen(bounds)
-            put("bounds", "${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}")
+    private suspend fun attachScreenContext(payload: JSONObject, screenState: JSONObject) {
+        val elements = screenState.optJSONArray("screenElements") ?: JSONArray()
+        payload.put("screen_state", elements)
+        payload.put("screenElements", elements)
+        payload.put("current_package_name", screenState.optString("current_package_name"))
+        payload.put("current_app_package", screenState.optString("current_package_name"))
+        payload.put("active_input_focused", screenState.optBoolean("active_input_focused"))
+        val hint = screenState.optString("focused_hint")
+        if (hint.isNotBlank() && hint != "null") {
+            payload.put("focused_hint", hint)
         }
-        array.put(nodeObj)
-
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i)
-            if (child != null) {
-                traverseAndExtract(child, array)
-                child.recycle()
+        if (elements.length() == 0) {
+            val screenshot = captureScreenshotBase64()
+            if (!screenshot.isNullOrBlank()) {
+                payload.put("screenshot_base64", screenshot)
             }
+        }
+    }
+
+    private suspend fun captureScreenshotBase64(): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            Log.w("AccessibilityAgent", "Screenshot capture requires API 30+; skipping Service 03 fallback image.")
+            return null
+        }
+        return kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    try {
+                        val buffer = screenshot.hardwareBuffer
+                        val bitmap = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
+                            ?.copy(Bitmap.Config.ARGB_8888, false)
+                        buffer.close()
+                        if (bitmap == null) {
+                            continuation.resume(null)
+                            return
+                        }
+                        val maxWidth = 720
+                        val scaled = if (bitmap.width > maxWidth) {
+                            val height = (bitmap.height.toFloat() / bitmap.width * maxWidth).toInt().coerceAtLeast(1)
+                            Bitmap.createScaledBitmap(bitmap, maxWidth, height, true)
+                        } else {
+                            bitmap
+                        }
+                        val out = ByteArrayOutputStream()
+                        scaled.compress(Bitmap.CompressFormat.JPEG, 55, out)
+                        continuation.resume(Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP))
+                    } catch (e: Exception) {
+                        Log.e("AccessibilityAgent", "Failed to encode screenshot for Service 03", e)
+                        continuation.resume(null)
+                    }
+                }
+
+                override fun onFailure(errorCode: Int) {
+                    Log.w("AccessibilityAgent", "takeScreenshot failed errorCode=$errorCode")
+                    continuation.resume(null)
+                }
+            })
+        }
+    }
+
+    private fun traverseAndExtract(rootNode: AccessibilityNodeInfo, array: JSONArray) {
+        val stack = mutableListOf<AccessibilityNodeInfo>()
+        stack.add(AccessibilityNodeInfo.obtain(rootNode))
+
+        while (stack.isNotEmpty()) {
+            val node = stack.removeAt(stack.size - 1)
+            val nodePackage = node.packageName?.toString() ?: ""
+
+            // 1. SYSTEM UI FILTERING - Skip nodes from SystemUI or overlays
+            if (nodePackage.contains("com.android.systemui", ignoreCase = true)) {
+                node.recycle()
+                continue
+            }
+
+            // 2. ENRICHED METADATA EXTRACTION
+            if (activePackageInCapture == null && nodePackage.isNotEmpty()) {
+                activePackageInCapture = nodePackage
+            }
+
+            if (node.isEditable && node.isFocused) {
+                isInputFocusedInCapture = true
+                focusedHintInCapture = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    node.hintText?.toString() ?: node.text?.toString()
+                } else {
+                    node.text?.toString()
+                }
+            }
+
+            val nodeObj = JSONObject().apply {
+                put("text", node.text?.toString() ?: "")
+                put("content_description", node.contentDescription?.toString() ?: "")
+                put("resource_id", node.viewIdResourceName ?: "")
+                put("class_name", node.className?.toString() ?: "")
+                put("package_name", nodePackage)
+                put("is_clickable", node.isClickable)
+                put("is_editable", node.isEditable)
+                put("is_focused", node.isFocused)
+                put("is_scrollable", node.isScrollable)
+                put("is_visible", node.isVisibleToUser)
+                put("is_enabled", node.isEnabled)
+                put("is_checked", node.isChecked)
+                put("is_selected", node.isSelected)
+
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                // Use standard [left,top][right,bottom] or explicit keys for backend clarity
+                put("bounds", JSONObject().apply {
+                    put("left", bounds.left)
+                    put("top", bounds.top)
+                    put("right", bounds.right)
+                    put("bottom", bounds.bottom)
+                })
+            }
+            array.put(nodeObj)
+
+            // Add children to stack in reverse order to maintain DFS left-to-right order if needed, 
+            // but standard DFS is fine here.
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i)
+                if (child != null) {
+                    stack.add(child)
+                }
+            }
+            node.recycle()
         }
     }
 }

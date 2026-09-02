@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     
     # LLM Configuration fields
     GROQ_API_KEY: str = ""
-    DEFAULT_LLM_MODEL: str = "llama-3.3-70b-versatile"
+    DEFAULT_LLM_MODEL: str = "llama-3.1-8b-instant"
+    USE_LLM_MOCK: bool = False
+    VISION_PERCEPTION_URL: str = "http://127.0.0.1:8010/api/v1"
     
     model_config = SettingsConfigDict(
         env_file=".env",

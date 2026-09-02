@@ -7,8 +7,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
 from app.schemas.request import IntentRequest, PlannerRequest
-from app.schemas.action_plan import ActionPlanResponse, ActionType, PlanStep, WaterfallTier
+from app.schemas.action_plan import ActionPlanResponse, ActionType, PlanStep, RiskLevel, WaterfallTier
 from app.services.planner_service import planner_service
+from app.services.safety_service import SafetyService
+from app.services.conversation_state import (
+    PlannerExecutionState,
+    conversation_state_manager,
+)
 
 
 @dataclass
@@ -353,6 +358,55 @@ class TaskSessionTracker:
 task_sessions = TaskSessionTracker()
 
 
+def apply_session_metadata(
+    plan: ActionPlanResponse,
+    session_id: str,
+    session_language: str,
+    message_type: str,
+) -> ActionPlanResponse:
+    """Commit a planner result and expose its state to the Gateway/TTS client."""
+    if plan.error == "HARD_STOP" or (plan.steps and plan.steps[0].action == ActionType.HARD_STOP):
+        plan.session_language = session_language
+        plan.approach = "SAFETY_INTERCEPT"
+        plan.execution_state = "ERROR"
+        conversation_state_manager.transition(
+            session_id,
+            PlannerExecutionState.ERROR,
+            session_language,
+            {"event": "safety_hard_stop", "plan_id": plan.plan_id},
+        )
+        return plan
+
+    approach = plan.approach or "SERVER_REPLANNING"
+    state = (
+        PlannerExecutionState.EXECUTING
+        if approach == "LOCAL_RESOLUTION" or message_type == "USER_INTENT_FEEDBACK"
+        else PlannerExecutionState.AWAITING_USER_CONFIRMATION
+    )
+    plan.session_language = session_language
+    plan.approach = approach
+    plan.execution_state = state.value
+    conversation_state_manager.transition(
+        session_id,
+        state,
+        session_language,
+        {"event": "planner_result", "approach": approach, "plan_id": plan.plan_id},
+    )
+    return plan
+
+
+def dispatch_plan(
+    plan: ActionPlanResponse,
+    user_prompt: str,
+    session_id: str,
+    session_language: str,
+    message_type: str,
+) -> ActionPlanResponse:
+    """Mandatory safety checkpoint between planner output and Gateway dispatch."""
+    intercepted, _blocked = SafetyService.intercept_plan(plan, user_prompt)
+    return apply_session_metadata(intercepted, session_id, session_language, message_type)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup tasks
@@ -399,61 +453,81 @@ async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
     user_id = request.user_id or "default_user"
     current_pkg = request.current_package_name or ""
     screen_elements = request.compressed_elements or []
+    session_id = request.session_id or request.task_id or "default_session"
+    previous_session = conversation_state_manager.get(session_id)
+    session_language = request.session_language or (previous_session.session_language if previous_session else "en-US")
+    conversation_state_manager.transition(
+        session_id,
+        PlannerExecutionState.PROCESSING_DOM,
+        session_language,
+        {"event": "user_turn", "prompt": user_prompt, "dom_nodes": len(screen_elements)},
+    )
+
+    prompt_reason = SafetyService.classify_red_reason(user_prompt)
+    if prompt_reason or SafetyService.evaluate_risk(user_prompt) == RiskLevel.RED:
+        return dispatch_plan(
+            SafetyService.build_hard_stop_plan(user_prompt, prompt_reason or "generic"),
+            user_prompt,
+            session_id,
+            session_language,
+            request.message_type,
+        )
 
     if request.message_type == "USER_INTENT_FEEDBACK":
         if not request.task_id:
             raise HTTPException(status_code=400, detail="task_id is required for intent feedback.")
-        try:
+        
+        with task_sessions._lock:
+            session = task_sessions._sessions.get(request.task_id)
+        
+        if session:
+            user_prompt = request.user_prompt or session.user_prompt or user_prompt
+            user_id = request.user_id or session.user_id or user_id
+
+        # 1. Check if recovery state machine needs to handle launcher/drawer failure fallback
+        if request.action_status.upper() == "FAILED" and task_sessions._is_launcher(current_pkg):
+            if session:
+                return dispatch_plan(task_sessions.apply_feedback(
+                    request.task_id,
+                    request.action_status,
+                    screen_elements,
+                    request.target_action,
+                    request.target_node,
+                    request.failure_reason,
+                    request.execution_attempt,
+                    request.status,
+                    current_pkg,
+                ), user_prompt, session_id, session_language, request.message_type)
+
+        # 2. Dynamic Turn Re-Evaluation with enriched screen context
+        new_plan = await planner_service.generate_plan(
+            user_id=user_id,
+            user_prompt=user_prompt,
+            current_app_package=current_pkg,
+            screen_state=screen_elements,
+            action_status=request.action_status, 
+            target_action=request.target_action,
+            task_id=request.task_id,
+            action_history=request.action_history,
+            active_input_focused=request.active_input_focused,
+            focused_hint=request.focused_hint,
+            session_language=session_language,
+            screenshot_base64=request.screenshot_base64,
+            vision_elements=request.vision_elements,
+        )
+        new_plan = dispatch_plan(new_plan, user_prompt, session_id, session_language, request.message_type)
+
+        # 3. Update or register the active session with the newly generated action step
+        if session:
             with task_sessions._lock:
-                session = task_sessions._sessions.get(request.task_id)
-            
-            if session:
-                user_prompt = request.user_prompt or session.user_prompt or user_prompt
-                user_id = request.user_id or session.user_id or user_id
+                session.plan = new_plan
+                session.current_step_index = 0
+                session.last_step_status = request.action_status.upper()
+                session.plan.current_step_index = 0
+        elif request.task_id:
+            task_sessions.create(request.task_id, new_plan, user_prompt, user_id)
 
-            # 1. Check if recovery state machine needs to handle launcher/drawer failure fallback
-            if request.action_status.upper() == "FAILED" and task_sessions._is_launcher(current_pkg):
-                if session:
-                    return task_sessions.apply_feedback(
-                        request.task_id,
-                        request.action_status,
-                        screen_elements,
-                        request.target_action,
-                        request.target_node,
-                        request.failure_reason,
-                        request.execution_attempt,
-                        request.status,
-                        current_pkg,
-                    )
-
-            # 2. Dynamic Turn Re-Evaluation with enriched screen context
-            new_plan = await planner_service.generate_plan(
-                user_id=user_id,
-                user_prompt=user_prompt,
-                current_app_package=current_pkg,
-                screen_state=screen_elements,
-                action_status=request.action_status, 
-                target_action=request.target_action,
-                task_id=request.task_id,
-                action_history=request.action_history,
-                active_input_focused=request.active_input_focused,
-                focused_hint=request.focused_hint,
-            )
-
-            # 3. Update the active session with the newly generated action step
-            if session:
-                with task_sessions._lock:
-                    session.plan = new_plan
-                    session.current_step_index = 0
-                    session.last_step_status = request.action_status.upper()
-                    session.plan.current_step_index = 0
-            else:
-                task_sessions.create(request.task_id, new_plan, user_prompt, user_id)
-
-            return new_plan
-
-        except KeyError:
-            raise HTTPException(status_code=404, detail="No active plan exists for this task_id.")
+        return new_plan
 
     # --- Initial Turn (Turn 1) ---
     if not request.user_prompt:
@@ -470,4 +544,13 @@ async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
         action_history=request.action_history,
         active_input_focused=request.active_input_focused,
         focused_hint=request.focused_hint,
+        session_language=session_language,
+        screenshot_base64=request.screenshot_base64,
+        vision_elements=request.vision_elements,
     )
+    plan = dispatch_plan(plan, user_prompt, session_id, session_language, request.message_type)
+
+    if request.task_id:
+        task_sessions.create(request.task_id, plan, user_prompt, user_id)
+
+    return plan

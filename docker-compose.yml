@@ -11,8 +11,10 @@ services:
     environment:
       - PORT=3000
       - INTENT_SAFETY_URL=http://intent-safety:8000/api/v1
+      - VISION_PERCEPTION_URL=http://vision-perception:8010/api/v1
     depends_on:
       - intent-safety
+      - vision-perception
     networks:
       - accessbridge-net
 
@@ -23,6 +25,24 @@ services:
     container_name: intent-safety-service
     ports:
       - "8000:8000"
+    environment:
+      - VISION_PERCEPTION_URL=http://vision-perception:8010/api/v1
+    depends_on:
+      - vision-perception
+    networks:
+      - accessbridge-net
+
+  vision-perception:
+    build:
+      context: ./services/vision-perception
+      dockerfile: Dockerfile
+    container_name: vision-perception-service
+    ports:
+      - "8010:8010"
+    environment:
+      - PORT=8010
+      - ENABLE_YOLO=true
+      - ENABLE_OCR=true
     networks:
       - accessbridge-net
 

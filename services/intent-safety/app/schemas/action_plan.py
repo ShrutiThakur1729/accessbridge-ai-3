@@ -20,6 +20,7 @@ class ActionType(str, Enum):
     SWIPE_UP = "SWIPE_UP"
     SWIPE_HORIZONTAL = "SWIPE_HORIZONTAL"
     FINISH = "FINISH"
+    HARD_STOP = "HARD_STOP"
 
 
 class WaterfallTier(int, Enum):
@@ -45,7 +46,9 @@ class PlanStep(BaseModel):
     target_text: Optional[str] = Field(None, description="Human-readable accessibility target")
     scroll_direction: Optional[str] = Field(None, description="Direction for SCROLL directives")
     reason: Optional[str] = Field(None, description="Planner rationale for a recovery action")
-    execution_mode: Optional[str] = Field(None, description="SYSTEM_INTENT or ACCESSIBILITY")
+    execution_mode: Optional[str] = Field(None, description="SYSTEM_INTENT, ACCESSIBILITY, or COORDINATE")
+    tap_x: Optional[float] = Field(None, description="Normalized 0-1 X coordinate from Service 03")
+    tap_y: Optional[float] = Field(None, description="Normalized 0-1 Y coordinate from Service 03")
 
     def model_post_init(self, __context: Any) -> None:
         if self.action_type is None:
@@ -55,7 +58,12 @@ class PlanStep(BaseModel):
         if self.action == ActionType.OPEN_APP and self.package_name is None:
             self.package_name = self.target_node
         if self.execution_mode is None:
-            self.execution_mode = "SYSTEM_INTENT" if self.action == ActionType.OPEN_APP else "ACCESSIBILITY"
+            if self.action == ActionType.OPEN_APP:
+                self.execution_mode = "SYSTEM_INTENT"
+            elif self.tap_x is not None and self.tap_y is not None:
+                self.execution_mode = "COORDINATE"
+            else:
+                self.execution_mode = "ACCESSIBILITY"
 
 
 class ActionPlanResponse(BaseModel):
@@ -69,6 +77,9 @@ class ActionPlanResponse(BaseModel):
     speech_response: Optional[str] = Field(None, description="User-facing execution or recovery message")
     is_completed: Optional[bool] = Field(default=None, description="Planner-declared terminal state")
     error: Optional[str] = Field(default=None, description="Machine-readable non-terminal planner error")
+    session_language: Optional[str] = Field(default=None, description="BCP-47 language for the client TTS response")
+    execution_state: Optional[str] = Field(default=None, description="Planner state-machine state")
+    approach: Optional[str] = Field(default=None, description="LOCAL_RESOLUTION or SERVER_REPLANNING")
 
     model_config = {
         "json_schema_extra": {

@@ -27,6 +27,12 @@ def _clean_node_entry(node: Dict[str, Any], role: str) -> Dict[str, Any]:
     bounds = _value(node, "bounds")
     if bounds:
         entry["bounds"] = bounds
+    if node.get("source"):
+        entry["source"] = node.get("source")
+    if node.get("tap_x") is not None and node.get("tap_y") is not None:
+        entry["tap_x"] = node.get("tap_x")
+        entry["tap_y"] = node.get("tap_y")
+        entry["is_clickable"] = True
     return entry
 
 
@@ -65,6 +71,7 @@ def compress_screen_state(screen_state: List[Dict[str, Any]]) -> Dict[str, Any]:
         is_clickable = _truthy(raw_node, "is_clickable", "isClickable", "clickable")
         is_editable = _truthy(raw_node, "is_editable", "isEditable", "editable")
         is_focused = _truthy(raw_node, "is_focused", "isFocused", "focused")
+        has_tap = raw_node.get("tap_x") is not None and raw_node.get("tap_y") is not None
         looks_like_input = any(token in view_id for token in ("input", "search", "edittext", "query"))
 
         # Detect active focused input field
@@ -83,7 +90,7 @@ def compress_screen_state(screen_state: List[Dict[str, Any]]) -> Dict[str, Any]:
                 ) or None
 
         # Categorize into interactive_targets vs secondary_metadata
-        if is_clickable or is_editable or is_focused or looks_like_input:
+        if is_clickable or is_editable or is_focused or looks_like_input or has_tap:
             if len(interactive_targets) < 60:
                 interactive_targets.append(_clean_node_entry(raw_node, "interactive_target"))
         elif text or content_desc:
