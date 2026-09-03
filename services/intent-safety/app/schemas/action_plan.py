@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import List, Optional, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 class RiskLevel(str, Enum):
@@ -31,16 +31,18 @@ class WaterfallTier(int, Enum):
 
 
 class PlanStep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    step_id: int = Field(..., description="1-indexed step number", example=1)
-    action: ActionType = Field(..., description="Primitive action type to execute")
+    # Allow extra fields safely to prevent crashes if LLMs output non-standard keys
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    step_id: int = Field(default=1, description="1-indexed step number", example=1)
+    action: ActionType = Field(default=ActionType.FINISH, description="Primitive action type to execute")
     target_node: Optional[str] = Field(None, description="UI Element ID, Text label, or OCR region", example="btn_send")
     input_data: Optional[str] = Field(None, description="Text value to type if action is TYPE_TEXT", example="50")
     tier: WaterfallTier = Field(default=WaterfallTier.TIER_3_ACCESSIBILITY, description="Assigned Waterfall Tier")
     requires_biometric: bool = Field(default=False, description="True if this specific step requires fingerprint auth")
-    # Additive protocol fields. `action` and `target_node` remain authoritative for
-    # existing Gateway/WebSocket clients.
-    action_type: ActionType = Field(None, description="Compatibility action name for direct executors")
+    
+    # Additive protocol fields for executor compatibility
+    action_type: Optional[ActionType] = Field(None, description="Compatibility action name for direct executors")
     package_name: Optional[str] = Field(None, description="Resolved package for OPEN_APP")
     fallback_package_name: Optional[str] = Field(None, description="Optional alternate package for OPEN_APP")
     target_text: Optional[str] = Field(None, description="Human-readable accessibility target")
@@ -49,6 +51,15 @@ class PlanStep(BaseModel):
     execution_mode: Optional[str] = Field(None, description="SYSTEM_INTENT, ACCESSIBILITY, or COORDINATE")
     tap_x: Optional[float] = Field(None, description="Normalized 0-1 X coordinate from Service 03")
     tap_y: Optional[float] = Field(None, description="Normalized 0-1 Y coordinate from Service 03")
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def validate_action(cls, v: Any) -> ActionType:
+        if isinstance(v, str):
+            v_upper = v.upper()
+            if v_upper in ActionType.__members__:
+                return ActionType[v_upper]
+        return v if isinstance(v, ActionType) else ActionType.FINISH
 
     def model_post_init(self, __context: Any) -> None:
         if self.action_type is None:
@@ -67,12 +78,14 @@ class PlanStep(BaseModel):
 
 
 class ActionPlanResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    plan_id: str = Field(..., description="Unique ID for tracking execution telemetry", example="plan_8871a")
-    user_goal: str = Field(..., description="Original or transcribed intent summary", example="Transfer money to Alice")
-    risk_level: RiskLevel = Field(..., description="Safety classifier score for the entire task")
-    total_steps: int = Field(..., description="Number of execution steps")
-    steps: List[PlanStep] = Field(..., description="Ordered list of steps for Service 04 to execute")
+    # Allow extra fields safely to avoid schema rejection from dynamic gateway attributes
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    plan_id: str = Field(default="plan_default", description="Unique ID for tracking execution telemetry", example="plan_8871a")
+    user_goal: str = Field(default="Process user request", description="Original or transcribed intent summary", example="Transfer money to Alice")
+    risk_level: RiskLevel = Field(default=RiskLevel.GREEN, description="Safety classifier score for the entire task")
+    total_steps: int = Field(default=0, description="Number of execution steps")
+    steps: List[PlanStep] = Field(default_factory=list, description="Ordered list of steps to execute")
     current_step_index: int = Field(default=0, description="Zero-indexed step currently ready for dispatch")
     speech_response: Optional[str] = Field(None, description="User-facing execution or recovery message")
     is_completed: Optional[bool] = Field(default=None, description="Planner-declared terminal state")
@@ -81,8 +94,19 @@ class ActionPlanResponse(BaseModel):
     execution_state: Optional[str] = Field(default=None, description="Planner state-machine state")
     approach: Optional[str] = Field(default=None, description="LOCAL_RESOLUTION or SERVER_REPLANNING")
 
-    model_config = {
-        "json_schema_extra": {
+    @field_validator("risk_level", mode="before")
+    @classmethod
+    def validate_risk_level(cls, v: Any) -> RiskLevel:
+        if isinstance(v, str):
+            v_upper = v.upper()
+            if v_upper in RiskLevel.__members__:
+                return RiskLevel[v_upper]
+        return v if isinstance(v, RiskLevel) else RiskLevel.GREEN
+
+    model_config = ConfigDict(
+        extra="ignore",
+        populate_by_name=True,
+        json_schema_extra={
             "example": {
                 "plan_id": "plan_9901a",
                 "user_goal": "Send $50 to Alice on Venmo",
@@ -96,16 +120,8 @@ class ActionPlanResponse(BaseModel):
                         "input_data": "50",
                         "tier": 3,
                         "requires_biometric": False
-                    },
-                    {
-                        "step_id": 2,
-                        "action": "CONFIRM_BIOMETRIC",
-                        "target_node": "pay_button",
-                        "input_data": None,
-                        "tier": 3,
-                        "requires_biometric": True
                     }
                 ]
             }
         }
-    }
+    )

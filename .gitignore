@@ -9,6 +9,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+venv310/
+.venv310/
+**/venv310/
 *.egg-info/
 
 # Node.js (Service 01 & 04)

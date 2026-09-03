@@ -530,8 +530,12 @@ async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
         return new_plan
 
     # --- Initial Turn (Turn 1) ---
-    if not request.user_prompt:
-        raise HTTPException(status_code=400, detail="user_prompt is required for intent planning.")
+    if not request.user_prompt and request.message_type == "USER_INTENT":
+    # If it's the very first intent turn and has no prompt or stored session state
+        raise HTTPException(
+            status_code=400, 
+            detail="user_prompt is required for initial intent planning."
+        )
     
     plan = await planner_service.generate_plan(
         user_id=user_id,

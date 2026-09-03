@@ -144,10 +144,6 @@ function actionTypeFor(step: PlannerDirective | null): PlannerActionType {
   return step ? (step.action_type || step.action) : "FINISH";
 }
 
-/**
- * Prunes non-actionable screen elements, soft-keyboard keys, and bloated visual properties
- * to drastically lower LLM token count and prevent TPM rate limits.
- */
 function compressScreenState(screenState: any[]): any[] {
   if (!Array.isArray(screenState)) return [];
 
@@ -159,21 +155,16 @@ function compressScreenState(screenState: any[]): any[] {
       const viewId = String(node.view_id || node.viewId || "").toLowerCase();
       const text = String(node.text || node.content_description || node.contentDescription || "").trim();
 
-      // Retain actionable, editable, or nodes with meaningful text
       const isClickable = Boolean(node.is_clickable || node.isClickable || node.clickable || (node.tap_x != null && node.tap_y != null));
       const isEditable = Boolean(node.is_editable || node.isEditable || node.editable);
 
-      // Never prune actionable controls, including one-character controls and
-      // in-app fields that only expose a view ID.
       if (isClickable || isEditable || text.length > 0) return true;
 
-      // Non-actionable keyboard/layout nodes add noise without aiding planning.
       if (className.includes("keyboard") || viewId.includes("keyboard")) return false;
 
       return false;
     })
     .slice(0, 45)
-    // Strip non-essential layout attributes (bounds, class names, focus state, etc.)
     .map((node) => {
       const cleanNode: Record<string, any> = {};
 
@@ -201,12 +192,8 @@ function compressScreenState(screenState: any[]): any[] {
 }
 
 export function setupWebSocketServer(wss: WebSocketServer) {
-  // Task context is deliberately keyed by Android's task_id, not a transient
-  // WebSocket connection ID, so execution can continue after reconnecting.
   const taskContexts = new Map<string, TaskContext>();
-  // ------------------------------------------------------------------
-  // 1. WebSocket Heartbeat Ping-Pong Mechanism (Prevents Timeouts)
-  // ------------------------------------------------------------------
+
   const pingInterval = setInterval(() => {
     wss.clients.forEach((ws: CustomWebSocket) => {
       if (ws.isAlive === false) {
@@ -235,10 +222,6 @@ export function setupWebSocketServer(wss: WebSocketServer) {
 
     logger.info({ clientId, clientIp }, "Client connected via WebSocket");
 
-    // Binary WebSocket frames have no task metadata. The Android client sends a
-    // HYBRID_AUDIO_START JSON frame first, then chunks, then HYBRID_AUDIO_END.
-    // One recorder is active per accessibility session, so one pending stream per
-    // socket is intentional and prevents chunks from crossing task boundaries.
     let pendingHybridAudio: PendingHybridAudio | undefined;
 
     const sendHybridFallback = (taskId: string | undefined, error: HybridPayloadError) => {
@@ -317,7 +300,6 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           pendingHybridAudio = undefined;
           hybridPayload = true;
         } else if (typeof parsedMessage.audio_base64 === "string") {
-          // Also support a single JSON frame for short recordings/files.
           const rawBase64 = parsedMessage.audio_base64.replace(/^data:[^;]+;base64,/, "").trim();
           if (!rawBase64 || !/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64)) {
             throw new HybridPayloadError("AUDIO_CORRUPT", "Voice payload is not valid base64 audio.");
@@ -339,8 +321,6 @@ export function setupWebSocketServer(wss: WebSocketServer) {
               String(parsedMessage.audio_mime_type || parsedMessage.mime_type || "audio/webm")
             );
             parsedMessage.transcript = sttResult.transcript;
-            // Explicit client metadata wins when supplied; otherwise preserve the
-            // language detected by STT for the entire session.
             parsedMessage.session_language = parsedMessage.session_language || parsedMessage.language_code || sttResult.language;
           } catch (error) {
             if (error instanceof SttError) {
@@ -350,16 +330,41 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           }
         }
 
-        // Extract multi-turn protocol fields sent from Android
         const taskId = parsedMessage.task_id || `task_${crypto.randomUUID().slice(0, 8)}`;
         const sessionId = String(parsedMessage.session_id || parsedMessage.sessionId || taskId);
         const messageType =
           parsedMessage.message_type === "USER_INTENT_FEEDBACK" || parsedMessage.type === "USER_INTENT_FEEDBACK"
             ? "USER_INTENT_FEEDBACK"
             : "USER_INTENT";
-        const providedTranscript = String(parsedMessage.transcript || parsedMessage.original_intent || "").trim();
+        
+        const providedTranscript = String(parsedMessage.transcript || parsedMessage.user_prompt || parsedMessage.original_intent || "").trim();
         const storedContext = taskContexts.get(taskId);
         const transcript = providedTranscript || storedContext?.transcript || "";
+
+        // --- FIX 1: Transcript Guard & Field Name Fix ---
+        if (!transcript && messageType === "USER_INTENT") {
+          logger.warn({ taskId, requestId }, "Received USER_INTENT with empty transcript. Aborting call to AI Planner.");
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              task_id: taskId,
+              session_id: sessionId,
+              speech_response: "I didn't capture any speech. Please try speaking your command again.",
+              action_type: "FINISH",
+              target_text: "",
+              package_name: "",
+              text_to_type: "",
+              scroll_direction: "",
+              execution_mode: "ACCESSIBILITY",
+              language_code: "en-US",
+              execution_state: "ERROR",
+              approach: "",
+              error: "EMPTY_TRANSCRIPT",
+              is_completed: true,
+            }));
+          }
+          return;
+        }
+
         const userId = parsedMessage.user_id || storedContext?.userId || "default_user";
         const sessionLanguage = normalizeLanguage(
           parsedMessage.session_language || parsedMessage.sessionLanguage || parsedMessage.language_code,
@@ -414,7 +419,6 @@ export function setupWebSocketServer(wss: WebSocketServer) {
         }
         taskContexts.set(taskId, taskContext);
 
-        // Compress screen state nodes before forwarding to Python Service 02
         const compressedScreenState = compressScreenState(screenState);
         const screenshotBase64 = screenshotFrom(parsedMessage);
         let visionElements = Array.isArray(parsedMessage.vision_elements) ? parsedMessage.vision_elements : [];
@@ -443,7 +447,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           "Compressed screen state and querying Python AI Planner"
         );
 
-        // Call Service 02 (Python FastAPI Planner) via IntentClient
+        // --- FIX 2: Mapping user_prompt explicitly for FastAPI schema ---
         const aiPlan = await IntentClient.evaluateIntent(
           {
             user_id: userId,
@@ -458,9 +462,8 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             failure_reason: parsedMessage.failure_reason || parsedMessage.error_message || "",
             execution_attempt: Number(parsedMessage.execution_attempt || 0),
             input_type: "TEXT",
+            user_prompt: transcript,
             text_prompt: transcript,
-            // Send the canonical fields used by the Phase 1 planner schema while
-            // retaining the legacy package name for older Service 02 deployments.
             current_package_name: currentPackageName,
             current_app_package: currentPackageName,
             active_input_focused: activeInputFocused,
@@ -473,7 +476,6 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           requestId
         );
 
-        // Map the current Python planner step to the Android action protocol format
         const currentStepIndex = aiPlan.current_step_index || 0;
         const currentStep =
           aiPlan.steps && aiPlan.steps.length > currentStepIndex ? aiPlan.steps[currentStepIndex] : null;

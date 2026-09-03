@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class InputType(str, Enum):
@@ -114,6 +114,14 @@ class PlannerRequest(BaseModel):
         description="Coordinate-mapped nodes already produced by Service 03",
         validation_alias=AliasChoices("vision_elements", "vision_screen_state"),
     )
+
+    @field_validator("user_prompt", mode="before")
+    @classmethod
+    def clean_user_prompt(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        string_val = str(value).strip()
+        return string_val if string_val else None
 
     @property
     def text_prompt(self) -> Optional[str]:

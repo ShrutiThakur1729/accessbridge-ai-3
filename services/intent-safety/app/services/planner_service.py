@@ -106,10 +106,9 @@ You MUST return a JSON object strictly matching the following schema:
             "USE_LLM_MOCK", str(getattr(settings, "USE_LLM_MOCK", False))
         ).strip().lower() in {"1", "true", "yes", "on"}
         self.client = AsyncOpenAI(
-            api_key=settings.GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        ) if not self.use_llm_mock and getattr(settings, "GROQ_API_KEY", None) else None
-
+            api_key=getattr(settings, "OPENAI_API_KEY", None) or "ollama", # Fallback dummy key
+            base_url=getattr(settings, "OPENAI_API_BASE", "http://localhost:11434/v1"),
+        ) if not self.use_llm_mock else None
     @staticmethod
     def _get_llm_mock_plan(user_prompt: str, risk_level: RiskLevel) -> ActionPlanResponse:
         """Return a deterministic, schema-valid plan without contacting Groq."""
@@ -424,7 +423,7 @@ You MUST return a JSON object strictly matching the following schema:
         )
 
         try:
-            model_name = "llama-3.1-8b-instant"
+            model_name = getattr(settings, "DEFAULT_LLM_MODEL", "llama3.1:8b")
             completion = await self.client.chat.completions.create(
                 model=model_name,
                 messages=[

@@ -75,6 +75,16 @@ class WebSocketManager(
 
     // Send payload (e.g., user speech transcript or screen context) upstream to Service 01
     fun sendPayload(payload: JSONObject): Boolean {
+        // Pre-send guard: Do not send USER_INTENT if transcript or user_prompt is empty
+        if (payload.optString("type") == "USER_INTENT") {
+            val transcript = payload.optString("transcript")
+            val userPrompt = payload.optString("user_prompt")
+            if (transcript.isEmpty() || userPrompt.isEmpty()) {
+                Log.w("WebSocketManager", "Aborting send: USER_INTENT has empty transcript or user_prompt.")
+                return false
+            }
+        }
+
         if (isConnected && webSocket != null) {
             return webSocket!!.send(payload.toString())
         } else {

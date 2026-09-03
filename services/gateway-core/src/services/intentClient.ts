@@ -48,6 +48,7 @@ export interface IntentRequestPayload {
   execution_attempt?: number;
   user_id: string;
   input_type: "TEXT" | "AUDIO";
+  user_prompt?: string;
   text_prompt?: string;
   audio_base64?: string;
   current_app_package?: string;
@@ -73,7 +74,8 @@ export interface IntentPlanResponse {
 
 export class IntentClient {
   static async evaluateIntent(payload: IntentRequestPayload, requestId: string): Promise<IntentPlanResponse> {
-    const url = `${ENV.INTENT_SAFETY_URL}/plan`;
+    const rawUrl = String(ENV.INTENT_SAFETY_URL || "http://localhost:8000/api/v1").replace(/\/$/, "");
+    const url = rawUrl.endsWith("/plan") ? rawUrl : `${rawUrl}/plan`;
     const taskId = payload.task_id || requestId;
     const controller = taskLockManager.acquireLock(taskId);
 
@@ -111,18 +113,22 @@ export class IntentClient {
 }
 
 export class VisionClient {
-  static async analyze(payload: {
-    screenshot_base64: string;
-    task_id?: string;
-    query_text?: string;
-  }, requestId: string): Promise<any | null> {
-    const baseUrl = String(ENV.VISION_PERCEPTION_URL || "").replace(/\/$/, "");
-    if (!baseUrl || !payload.screenshot_base64) {
+  static async analyze(
+    payload: {
+      screenshot_base64: string;
+      task_id?: string;
+      query_text?: string;
+    },
+    requestId: string
+  ): Promise<any | null> {
+    const rawUrl = String(ENV.VISION_PERCEPTION_URL || "http://localhost:8010/api/v1").replace(/\/$/, "");
+    if (!payload.screenshot_base64) {
       return null;
     }
 
-    const url = `${baseUrl}/analyze`;
-    logger.info({ requestId, url, taskId: payload.task_id }, "Routing fallback screenshot to Service 03");
+    // Ensures endpoint resolves to /api/v1/analyze regardless of env formatting
+    const url = rawUrl.endsWith("/analyze") ? rawUrl : `${rawUrl}/api/v1/analyze`;
+    logger.info({ requestId, url, taskId: payload.task_id }, "Routing fallback screenshot to Service 04 Vision Perception");
 
     try {
       const response = await fetch(url, {
@@ -135,19 +141,24 @@ export class VisionClient {
           image_base64: payload.screenshot_base64,
         }),
       });
+
       if (!response.ok) {
         const errorText = await response.text();
-        logger.warn({ requestId, status: response.status, errorText }, "Service 03 analyze failed");
+        logger.warn({ requestId, status: response.status, errorText }, "Service 04 analyze failed");
         return null;
       }
-      const data = await response.json();
+
+      const data = (await response.json()) as {
+        engine?: string;
+        elements?: any[];
+      };
       logger.info(
         { requestId, taskId: payload.task_id, engine: data?.engine, detections: (data?.elements || []).length },
-        "Service 03 returned coordinate payload"
+        "Service 04 returned coordinate payload"
       );
       return data;
     } catch (error) {
-      logger.warn({ requestId, error: (error as any)?.message || String(error) }, "Service 03 unreachable");
+      logger.warn({ requestId, error: (error as any)?.message || String(error) }, "Service 04 unreachable");
       return null;
     }
   }
