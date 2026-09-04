@@ -75,6 +75,12 @@ class WebSocketManager(
 
     // Send payload (e.g., user speech transcript or screen context) upstream to Service 01
     fun sendPayload(payload: JSONObject): Boolean {
+        // GUARD: If not connected, don't even try OkHttp. 
+        // This prevents the 40ms flood of socket errors.
+        if (webSocket == null || !isConnected) {
+            return false 
+        }
+
         // Pre-send guard: Do not send USER_INTENT if transcript or user_prompt is empty
         if (payload.optString("type") == "USER_INTENT") {
             val transcript = payload.optString("transcript")
@@ -85,11 +91,12 @@ class WebSocketManager(
             }
         }
 
-        if (isConnected && webSocket != null) {
-            return webSocket!!.send(payload.toString())
-        } else {
-            Log.e("WebSocketManager", "Cannot send payload; socket is disconnected.")
-            return false
+        return try {
+            webSocket?.send(payload.toString()) ?: false
+        } catch (e: Exception) {
+            Log.e("WebSocketManager", "Send error: ${e.message}")
+            isConnected = false
+            false
         }
     }
 

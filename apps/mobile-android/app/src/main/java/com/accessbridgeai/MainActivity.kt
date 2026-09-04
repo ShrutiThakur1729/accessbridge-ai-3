@@ -12,9 +12,10 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.text.TextUtils
 import android.util.Log
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricPrompt
+import androidx.fragment.app.FragmentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
@@ -30,7 +31,12 @@ import com.accessbridgeai.ui.screens.*
 import com.accessbridgeai.ui.theme.AccessbridgeAIITheme
 import org.json.JSONObject
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
+
+    companion object {
+        private var _instance: MainActivity? = null
+        val instance: MainActivity? get() = _instance
+    }
 
     private lateinit var sessionManager: SessionManager
     private val onboardingViewModel: OnboardingViewModel by viewModels()
@@ -39,6 +45,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        _instance = this
         sessionManager = SessionManager(this)
         enableEdgeToEdge()
         
@@ -182,6 +189,43 @@ class MainActivity : ComponentActivity() {
         }
         Log.d("MainActivity", "Registration Payload: $payload")
         AccessibilityAgentService.instance?.sendPayload(payload)
+    }
+
+    override fun onDestroy() {
+        if (_instance == this) _instance = null
+        super.onDestroy()
+    }
+
+    fun showBiometricPrompt(onSuccess: () -> Unit, onError: () -> Unit) {
+        val executor = ContextCompat.getMainExecutor(this)
+        val biometricPrompt = BiometricPrompt(this, executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                    Log.e("MainActivity", "Authentication error: $errString")
+                    onError()
+                }
+
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    Log.d("MainActivity", "Authentication succeeded!")
+                    onSuccess()
+                }
+
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                    Log.w("MainActivity", "Authentication failed")
+                    onError()
+                }
+            })
+
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Security Authentication Required")
+            .setSubtitle("Authenticate to proceed")
+            .setNegativeButtonText("Cancel")
+            .build()
+
+        biometricPrompt.authenticate(promptInfo)
     }
 }
 

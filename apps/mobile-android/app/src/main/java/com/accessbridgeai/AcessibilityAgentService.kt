@@ -6,6 +6,7 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.graphics.Bitmap
 import android.graphics.Path
+import android.graphics.PointF
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -108,24 +109,9 @@ class AccessibilityAgentService : AccessibilityService() {
         // 1. Acknowledge user with chime
         voiceAssistantManager?.playChime()
 
-        // 2. Start background audio streaming concurrently
-        voiceAssistantManager?.startAudioStreaming(taskId) { chunk ->
-            sendPayload(chunk)
-        }
-
-        serviceScope.launch {
-            // 3. Capture DOM context
-            val screenState = captureScreenStateWithRetry()
-            
-            // 4. Send hybrid trigger payload with DOM context
-            val triggerPayload = JSONObject().apply {
-                put("type", "VOICE_TRIGGER")
-                put("task_id", taskId)
-                put("timestamp", System.currentTimeMillis())
-            }
-            attachScreenContext(triggerPayload, screenState)
-            Log.d("AccessibilityAgent", "Sending Hybrid Trigger Payload: ${triggerPayload.toString(2)}")
-            sendPayload(triggerPayload)
+        // 2. Trigger local Speech-to-Text listening
+        serviceScope.launch(Dispatchers.Main) {
+            voiceAssistantManager?.startListening()
         }
     }
 
@@ -134,8 +120,15 @@ class AccessibilityAgentService : AccessibilityService() {
             serverUrl = "ws://192.168.29.217:3000",
             onMessageReceived = { json -> handleBackendDirective(json) },
             onConnectionStatusChanged = { connected ->
+                val wasConnected = _connectionStatus.value
                 Log.d("AccessibilityAgent", "WebSocket connected: $connected")
                 _connectionStatus.value = connected
+                if (wasConnected && !connected) {
+                    voiceAssistantManager?.stopAudioStreaming()
+                    serviceScope.launch(Dispatchers.Main) {
+                        Toast.makeText(this@AccessibilityAgentService, "Server Connection Lost", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         )
         webSocketManager?.connect()
@@ -145,7 +138,7 @@ class AccessibilityAgentService : AccessibilityService() {
             onSpeechRecognized = { transcript ->
                 Log.d("AccessibilityAgent", "Final Transcript: $transcript")
                 _partialTranscript.value = transcript
-                sendTranscriptToBackend(transcript)
+                sendUserIntent(transcript)
             },
             onSpeechStateChanged = { state ->
                 Log.d("AccessibilityAgent", "Speech State: $state")
@@ -188,7 +181,15 @@ class AccessibilityAgentService : AccessibilityService() {
         if (success) {
             Log.d("AccessibilityAgent", "Successfully queued payload for transmission.")
         } else {
-            Log.e("AccessibilityAgent", "Failed to send payload via WebSocket. Connection state: ${_connectionStatus.value}")
+            val wasConnected = _connectionStatus.value
+            Log.e("AccessibilityAgent", "Failed to send payload via WebSocket. Connection state: $wasConnected")
+            if (wasConnected) {
+                _connectionStatus.value = false
+                voiceAssistantManager?.stopAudioStreaming()
+                serviceScope.launch(Dispatchers.Main) {
+                    Toast.makeText(this@AccessibilityAgentService, "Server Connection Lost", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
@@ -210,7 +211,7 @@ class AccessibilityAgentService : AccessibilityService() {
         }
     }
 
-    private fun sendTranscriptToBackend(transcript: String) {
+    private fun sendUserIntent(transcript: String) {
         val taskId = java.util.UUID.randomUUID().toString()
         currentTaskId = taskId
         currentOriginalIntent = transcript
@@ -232,7 +233,32 @@ class AccessibilityAgentService : AccessibilityService() {
     }
 
     private fun handleBackendDirective(json: JSONObject) {
-        // 1. Handle non-UI directives immediately (can stay on background/caller thread)
+        // 1. Immediate termination for all error conditions (Empty, 400, or Error Directive)
+        val status = json.optInt("status", 200)
+        val error = json.optString("error")
+        val isEmpty = json.length() == 0
+
+        if (isEmpty || status == 400 || (error.isNotEmpty() && error != "NONE")) {
+            val notice = when {
+                isEmpty -> "Empty server response."
+                status == 400 -> "Server returned a 400 error."
+                else -> "Server error: $error"
+            }
+
+            Log.e("AccessibilityAgent", "Backend failure intercepted: $notice")
+            
+            executionAttempts.clear()
+            voiceAssistantManager?.stopAllOperations()
+            activeDirectiveJob?.cancel()
+
+            serviceScope.launch {
+                Toast.makeText(this@AccessibilityAgentService, notice, Toast.LENGTH_LONG).show()
+                voiceAssistantManager?.speak(notice)
+            }
+            return
+        }
+
+        // 2. Handle non-UI directives immediately (can stay on background/caller thread)
         val audioResponse = json.optString("audio_response")
         if (audioResponse.isNotBlank()) {
             voiceAssistantManager?.playAudioResponse(audioResponse)
@@ -242,29 +268,10 @@ class AccessibilityAgentService : AccessibilityService() {
             voiceAssistantManager?.stopAudioStreaming()
         }
 
-        // 2. Transition to Main thread for UI-dependent actions and state updates
+        // 3. Transition to Main thread for UI-dependent actions and state updates
         activeDirectiveJob?.cancel()
         activeDirectiveJob = serviceScope.launch {
             try {
-                // Guard: Handle empty response, 400 status, or error directives
-                val status = json.optInt("status", 200)
-                val error = json.optString("error")
-                if (json.length() == 0 || status == 400 || (error.isNotEmpty() && error != "NONE")) {
-                    Log.e("AccessibilityAgent", "Backend error intercepted: status=$status, error=$error")
-                    executionAttempts.clear()
-                    voiceAssistantManager?.stopAllOperations()
-
-                    val notice = when {
-                        json.length() == 0 -> "Empty server response."
-                        status == 400 -> "Server returned a 400 error."
-                        else -> "Server error: $error"
-                    }
-
-                    Toast.makeText(this@AccessibilityAgentService, notice, Toast.LENGTH_LONG).show()
-                    voiceAssistantManager?.speak(notice)
-                    return@launch
-                }
-
                 val speechResponse = json.optString("speech_response")
                 val actionType = json.optString("action_type")
                 val targetText = json.optString("target_text")
@@ -272,6 +279,7 @@ class AccessibilityAgentService : AccessibilityService() {
                 val textToType = json.optString("text_to_type")
                 val scrollDirection = json.optString("scroll_direction")
                 val executionMode = json.optString("execution_mode")
+                val requiresBiometric = json.optBoolean("requires_biometric", false)
                 val isCompleted = json.optBoolean("is_completed", false)
                 val taskId = json.optString("task_id")
                 val tapX = if (json.has("tap_x") && !json.isNull("tap_x")) json.optDouble("tap_x") else Double.NaN
@@ -283,7 +291,55 @@ class AccessibilityAgentService : AccessibilityService() {
 
                 Log.d("AccessibilityAgent", "Processing directive: $actionType, task_id: $currentTaskId")
 
-                // 3. Text-to-Speech (TTS) Execution (Local Fallback)
+                // Interceptor for Biometric Authentication
+                if (requiresBiometric || actionType == "CONFIRM_BIOMETRIC") {
+                    Log.d("AccessibilityAgent", "Biometric authentication required for action: $actionType")
+                    val mainActivity = MainActivity.instance
+                    if (mainActivity == null) {
+                        Log.e("AccessibilityAgent", "MainActivity instance is null, cannot show biometric prompt")
+                        val feedback = JSONObject().apply {
+                            put("type", "USER_INTENT_FEEDBACK")
+                            put("task_id", currentTaskId ?: "")
+                            put("action_status", "FAILED")
+                            put("failure_reason", "BIOMETRIC_FAILED")
+                        }
+                        sendPayload(feedback)
+                        return@launch
+                    }
+
+                    mainActivity.showBiometricPrompt(
+                        onSuccess = {
+                            serviceScope.launch {
+                                // Re-process the directive but skip the biometric check if it was just a confirm
+                                if (actionType == "CONFIRM_BIOMETRIC") {
+                                    val feedback = JSONObject().apply {
+                                        put("type", "USER_INTENT_FEEDBACK")
+                                        put("task_id", currentTaskId ?: "")
+                                        put("action_status", "SUCCESS")
+                                    }
+                                    sendPayload(feedback)
+                                } else {
+                                    // Execute the actual action after successful auth
+                                    executeDirectiveAction(json)
+                                }
+                            }
+                        },
+                        onError = {
+                            serviceScope.launch {
+                                val feedback = JSONObject().apply {
+                                    put("type", "USER_INTENT_FEEDBACK")
+                                    put("task_id", currentTaskId ?: "")
+                                    put("action_status", "FAILED")
+                                    put("failure_reason", "BIOMETRIC_FAILED")
+                                }
+                                sendPayload(feedback)
+                            }
+                        }
+                    )
+                    return@launch
+                }
+
+                // 4. Text-to-Speech (TTS) Execution (Local Fallback)
                 if (speechResponse.isNotBlank()) {
                     voiceAssistantManager?.speak(speechResponse)
                 }
@@ -297,71 +353,104 @@ class AccessibilityAgentService : AccessibilityService() {
                     return@launch
                 }
 
-                var actionResult: ActionResult? = null
-
-                when (actionType) {
-                    "OPEN_APP" -> {
-                        if (!packageName.isNullOrBlank()) {
-                            actionResult = openAppByPackage(packageName, targetText)
-                        } else {
-                            actionResult = ActionResult(false, "INVALID_ARGUMENT", "Package name is missing in OPEN_APP directive.")
-                        }
-                    }
-                    "CLICK" -> {
-                        actionResult = when {
-                            executionMode == "COORDINATE" && !tapX.isNaN() && !tapY.isNaN() ->
-                                clickAtNormalized(tapX, tapY)
-                            !targetText.isNullOrBlank() -> clickElementByText(targetText)
-                            !tapX.isNaN() && !tapY.isNaN() -> clickAtNormalized(tapX, tapY)
-                            else -> ActionResult(false, "INVALID_ARGUMENT", "Target text is missing for CLICK.")
-                        }
-                    }
-                    "TYPE_TEXT" -> {
-                        actionResult = if (!textToType.isNullOrBlank()) typeTextIntoFocusedNode(textToType)
-                                     else ActionResult(false, "INVALID_ARGUMENT", "Text to type is missing for TYPE_TEXT.")
-                    }
-                    "SCROLL" -> {
-                        actionResult = performScroll(scrollDirection)
-                    }
-                    "SWIPE_UP" -> {
-                        val success = swipeUpToOpenDrawer()
-                        actionResult = ActionResult(success, if (success) "SUCCESS" else "GESTURE_FAILED")
-                    }
-                    "SWIPE_HORIZONTAL" -> {
-                        val direction = json.optString("direction", "LEFT")
-                        val success = scrollLauncherPage(direction)
-                        actionResult = ActionResult(success, if (success) "SUCCESS" else "GESTURE_FAILED")
-                    }
-                    "NONE" -> actionResult = ActionResult(true, "SUCCESS")
-                }
-
-                if (actionType != "NONE" && actionResult != null) {
-                    if (actionResult.status == "HOME_FALLBACK_STARTED") {
-                        // Standardized async transition handling: return early and let the
-                        // coroutine-based fallback handle the eventual feedback payload.
-                        return@launch
-                    }
-
-                    val targetNode = when (actionType) {
-                        "OPEN_APP" -> actionResult.packageLaunched ?: packageName
-                        "CLICK" -> targetText
-                        "TYPE_TEXT" -> targetText
-                        else -> targetText
-                    }
-                    // OPEN_APP result is now delayed until the target app actually renders nodes
-                    // to avoid sending empty screen_state payloads to the backend.
-                    sendFeedbackAfterAction(
-                        result = actionResult,
-                        actionType = actionType,
-                        targetNode = targetNode,
-                        targetPackage = actionResult.packageLaunched ?: packageName,
-                        immediate = false,
-                        debounce = !actionResult.success
-                    )
-                }
+                // 5. Coordinate Tap Handling
+                executeDirectiveAction(json)
             } catch (e: Exception) {
                 Log.e("AccessibilityAgent", "Error parsing backend directive", e)
             }
+        }
+    }
+
+    private suspend fun executeDirectiveAction(json: JSONObject) {
+        val actionType = json.optString("action_type")
+        val targetText = json.optString("target_text")
+        val packageName = json.optString("package_name")
+        val textToType = json.optString("text_to_type")
+        val scrollDirection = json.optString("scroll_direction")
+        val executionMode = json.optString("execution_mode")
+        val tapX = if (json.has("tap_x") && !json.isNull("tap_x")) json.optDouble("tap_x") else Double.NaN
+        val tapY = if (json.has("tap_y") && !json.isNull("tap_y")) json.optDouble("tap_y") else Double.NaN
+
+        // 5. Coordinate Tap Handling
+        // If execution_mode is COORDINATE or tap coordinates are provided, perform direct gesture
+        if (executionMode == "COORDINATE" || (!tapX.isNaN() && !tapY.isNaN())) {
+            val point = resolveCoordinates(tapX, tapY)
+            tapAtCoordinates(point.x, point.y)
+            return
+        }
+
+        var actionResult: ActionResult? = null
+
+        when (actionType) {
+            "OPEN_APP" -> {
+                if (!packageName.isNullOrBlank()) {
+                    actionResult = openAppByPackage(packageName, targetText)
+                } else {
+                    actionResult = ActionResult(
+                        false,
+                        "INVALID_ARGUMENT",
+                        "Package name is missing in OPEN_APP directive."
+                    )
+                }
+            }
+            "CLICK" -> {
+                actionResult = if (!targetText.isNullOrBlank()) {
+                    clickElementByText(targetText)
+                } else {
+                    ActionResult(
+                        false,
+                        "INVALID_ARGUMENT",
+                        "Target text or coordinates missing for CLICK."
+                    )
+                }
+            }
+            "TYPE_TEXT" -> {
+                actionResult = if (!textToType.isNullOrBlank()) typeTextIntoFocusedNode(textToType)
+                else ActionResult(
+                    false,
+                    "INVALID_ARGUMENT",
+                    "Text to type is missing for TYPE_TEXT."
+                )
+            }
+            "SCROLL" -> {
+                actionResult = performScroll(scrollDirection)
+            }
+            "SWIPE_UP" -> {
+                val success = swipeUpToOpenDrawer()
+                actionResult = ActionResult(success, if (success) "SUCCESS" else "GESTURE_FAILED")
+            }
+            "SWIPE_HORIZONTAL" -> {
+                val direction = json.optString("direction", "LEFT")
+                val success = scrollLauncherPage(direction)
+                actionResult = ActionResult(success, if (success) "SUCCESS" else "GESTURE_FAILED")
+            }
+            "NONE" -> actionResult = ActionResult(true, "SUCCESS")
+            "CONFIRM_BIOMETRIC" -> actionResult = ActionResult(true, "SUCCESS")
+        }
+
+        if (actionType != "NONE" && actionResult != null) {
+            if (actionResult.status == "HOME_FALLBACK_STARTED") {
+                // Standardized async transition handling: return early and let the
+                // coroutine-based fallback handle the eventual feedback payload.
+                return
+            }
+
+            val targetNode = when (actionType) {
+                "OPEN_APP" -> actionResult.packageLaunched ?: packageName
+                "CLICK" -> targetText
+                "TYPE_TEXT" -> targetText
+                else -> targetText
+            }
+            // OPEN_APP result is now delayed until the target app actually renders nodes
+            // to avoid sending empty screen_state payloads to the backend.
+            sendFeedbackAfterAction(
+                result = actionResult,
+                actionType = actionType,
+                targetNode = targetNode,
+                targetPackage = actionResult.packageLaunched ?: packageName,
+                immediate = false,
+                debounce = !actionResult.success
+            )
         }
     }
 
@@ -1129,6 +1218,53 @@ class AccessibilityAgentService : AccessibilityService() {
                 }
             })
         }
+    }
+
+    private fun tapAtCoordinates(x: Float, y: Float) {
+        val path = Path().apply {
+            moveTo(x, y)
+            lineTo(x, y)
+        }
+        val gestureBuilder = GestureDescription.Builder()
+        // 50ms tap duration as requested
+        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+        gestureBuilder.addStroke(stroke)
+
+        Log.d("AccessibilityAgent", "Executing coordinate tap at ($x, $y)")
+        dispatchGesture(gestureBuilder.build(), object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                super.onCompleted(gestureDescription)
+                val feedback = JSONObject().apply {
+                    put("type", "USER_INTENT_FEEDBACK")
+                    put("task_id", currentTaskId ?: "")
+                    put("action_status", "SUCCESS")
+                }
+                sendPayload(feedback)
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                super.onCancelled(gestureDescription)
+                Log.e("AccessibilityAgent", "Coordinate tap cancelled at ($x, $y)")
+                val feedback = JSONObject().apply {
+                    put("type", "USER_INTENT_FEEDBACK")
+                    put("task_id", currentTaskId ?: "")
+                    put("action_status", "FAILED")
+                    put("failure_reason", "GESTURE_CANCELLED")
+                }
+                sendPayload(feedback)
+            }
+        }, null)
+    }
+
+    private fun resolveCoordinates(x: Double, y: Double): PointF {
+        val dm = resources.displayMetrics
+        val screenWidth = dm.widthPixels.toFloat()
+        val screenHeight = dm.heightPixels.toFloat()
+
+        val realX = if (x in 0.0..1.0) (x * screenWidth).toFloat() else x.toFloat()
+        val realY = if (y in 0.0..1.0) (y * screenHeight).toFloat() else y.toFloat()
+
+        return PointF(realX, realY)
     }
 
     private fun traverseAndExtract(rootNode: AccessibilityNodeInfo, array: JSONArray) {

@@ -31,6 +31,8 @@ export interface PlannerDirective {
 
 export interface ActionHistoryEntry {
   action_type: string;
+  target_node?: string;
+  target_text?: string;
   package_name?: string;
   status: string;
 }
@@ -126,7 +128,6 @@ export class VisionClient {
       return null;
     }
 
-    // Ensures endpoint resolves to /api/v1/analyze regardless of env formatting
     const url = rawUrl.endsWith("/analyze") ? rawUrl : `${rawUrl}/api/v1/analyze`;
     logger.info({ requestId, url, taskId: payload.task_id }, "Routing fallback screenshot to Service 04 Vision Perception");
 

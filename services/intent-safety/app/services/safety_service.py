@@ -14,21 +14,17 @@ class SafetyService:
     Evaluates risk and enforces a mandatory pre-dispatch intercept.
 
     GREEN: Read-only, search, navigation, opening system tools
-    YELLOW: Drafting text, non-critical updates, filling fields
-    RED: Financial transfers, unauthorized access, destructive changes
+    YELLOW: Drafting text, non-critical updates, filling fields, sending chat messages
+    RED: Financial transfers, unauthorized access, destructive changes (Requires Confirmation/Biometric)
     """
 
+    # Strictly financial or destructive keywords that elevate overall risk
     RED_KEYWORDS = [
-        "pay",
         "send money",
-        "transfer",
+        "transfer money",
+        "pay",
         "withdraw",
-        "delete",
-        "remove account",
-        "password",
-        "pin",
-        "transaction",
-        "buy",
+        "delete account",
         "factory reset",
         "wipe data",
         "uninstall",
@@ -38,33 +34,26 @@ class SafetyService:
         "bypass lock",
         "root device",
         "hack",
-        "unauthorized",
     ]
 
     YELLOW_KEYWORDS = [
         "type",
         "draft",
         "message",
+        "send a message",
         "write",
         "search for",
         "update profile",
+        "send",
     ]
 
     DESTRUCTIVE_STEP_MARKERS = [
-        "delete",
-        "uninstall",
-        "wipe",
-        "factory",
-        "reset",
-        "remove account",
-        "grant",
-        "permission",
-        "password",
-        "pin",
-        "pay",
-        "transfer",
-        "confirm payment",
-        "buy",
+        "delete_account",
+        "uninstall_app",
+        "factory_reset",
+        "format_device",
+        "grant_permission",
+        "bypass_security",
     ]
 
     SAFE_HARBOR_MESSAGES = {
@@ -103,35 +92,21 @@ class SafetyService:
     @staticmethod
     def classify_red_reason(user_prompt: str, plan: Optional[ActionPlanResponse] = None) -> Optional[str]:
         haystack = user_prompt.lower()
-        if plan:
-            for step in plan.steps:
-                haystack += " " + " ".join(
-                    filter(
-                        None,
-                        [
-                            step.action.value if step.action else "",
-                            step.target_node,
-                            step.target_text,
-                            step.reason,
-                            step.input_data,
-                        ],
-                    )
-                ).lower()
 
-        if re.search(r"\b(pay|send money|transfer|withdraw|transaction|buy|purchase)\b", haystack):
+        # Strict checks for actual financial transaction phrasing (not generic "send")
+        if re.search(r"\b(send money|transfer money|pay bill|withdraw cash|confirm payment|buy item)\b", haystack):
             return "financial"
-        if re.search(r"\b(delete|uninstall|wipe|factory reset|remove account|format)\b", haystack):
+        if re.search(r"\b(factory reset|wipe data|uninstall app|format device|delete account)\b", haystack):
             return "destructive"
-        if re.search(r"\b(hack|bypass|unauthorized|root|grant all permissions|disable accessibility|password|pin)\b", haystack):
+        if re.search(r"\b(hack|bypass lock|root device|disable accessibility)\b", haystack):
             return "unauthorized"
-        if SafetyService.evaluate_risk(user_prompt) == RiskLevel.RED:
-            return "generic"
+
         return None
 
     @staticmethod
-    def _step_is_red(step: PlanStep) -> bool:
+    def _step_is_destructive(step: PlanStep) -> bool:
         blob = " ".join(
-            filter(None, [step.action.value, step.target_node, step.target_text, step.input_data, step.reason])
+            filter(None, [step.action.value if step.action else "", step.target_node, step.target_text, step.reason])
         ).lower()
         return any(marker in blob for marker in SafetyService.DESTRUCTIVE_STEP_MARKERS)
 
@@ -183,16 +158,23 @@ class SafetyService:
     def intercept_plan(plan: ActionPlanResponse, user_prompt: str) -> Tuple[ActionPlanResponse, bool]:
         """Mandatory checkpoint between planner output and Gateway dispatch."""
         reason = SafetyService.classify_red_reason(user_prompt, plan)
-        step_hit = any(SafetyService._step_is_red(step) for step in plan.steps)
-        if plan.risk_level == RiskLevel.RED or reason or step_hit:
-            reason_code = reason or "generic"
+        has_destructive_step = any(SafetyService._step_is_destructive(step) for step in plan.steps)
+
+        # Only trigger HARD_STOP for truly destructive or unauthorized actions
+        if reason in ["destructive", "unauthorized"] or has_destructive_step:
+            reason_code = reason or "destructive"
             logger.info(
-                "Pre-execution safety intercept blocked plan_id=%s reason=%s step_hit=%s",
+                "Pre-execution safety intercept issued HARD_STOP plan_id=%s reason=%s",
                 plan.plan_id,
                 reason_code,
-                step_hit,
             )
             return SafetyService.build_hard_stop_plan(user_prompt, reason_code, plan), True
+
+        # For financial or RED risk items, enforce biometric check flag on step instead of hard stopping
+        if plan.risk_level == RiskLevel.RED or reason == "financial":
+            for step in plan.steps:
+                if step.action in [ActionType.CLICK, ActionType.CONFIRM_BIOMETRIC]:
+                    step.requires_biometric = True
 
         logger.info("Pre-execution safety intercept passed plan_id=%s risk=%s", plan.plan_id, plan.risk_level)
         return plan, False

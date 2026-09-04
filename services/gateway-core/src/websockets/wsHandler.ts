@@ -192,7 +192,7 @@ function compressScreenState(screenState: any[]): any[] {
 }
 
 export function setupWebSocketServer(wss: WebSocketServer) {
-  const taskContexts = new Map<string, TaskContext>();
+  const sessionContexts = new Map<string, TaskContext>();
 
   const pingInterval = setInterval(() => {
     wss.clients.forEach((ws: CustomWebSocket) => {
@@ -338,10 +338,9 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             : "USER_INTENT";
         
         const providedTranscript = String(parsedMessage.transcript || parsedMessage.user_prompt || parsedMessage.original_intent || "").trim();
-        const storedContext = taskContexts.get(taskId);
+        const storedContext = sessionContexts.get(sessionId);
         const transcript = providedTranscript || storedContext?.transcript || "";
 
-        // --- FIX 1: Transcript Guard & Field Name Fix ---
         if (!transcript && messageType === "USER_INTENT") {
           logger.warn({ taskId, requestId }, "Received USER_INTENT with empty transcript. Aborting call to AI Planner.");
           if (ws.readyState === WebSocket.OPEN) {
@@ -410,14 +409,18 @@ export function setupWebSocketServer(wss: WebSocketServer) {
         ).trim();
         const originalElementsCount = Array.isArray(screenState) ? screenState.length : 0;
         const executedAction = parsedMessage.target_action || parsedMessage.action_type || parsedMessage.action;
+
+        // Populate complete Action History details for target blacklisting in planner_service.py
         if (executedAction && actionStatus.toUpperCase() !== "INITIAL") {
           taskContext.actionHistory.push({
             action_type: String(executedAction),
+            target_node: parsedMessage.target_node || undefined,
+            target_text: parsedMessage.target_text || undefined,
             package_name: parsedMessage.package_name || parsedMessage.target_package || undefined,
             status: actionStatus.toUpperCase(),
           });
         }
-        taskContexts.set(taskId, taskContext);
+        sessionContexts.set(sessionId, taskContext);
 
         const compressedScreenState = compressScreenState(screenState);
         const screenshotBase64 = screenshotFrom(parsedMessage);
@@ -447,7 +450,6 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           "Compressed screen state and querying Python AI Planner"
         );
 
-        // --- FIX 2: Mapping user_prompt explicitly for FastAPI schema ---
         const aiPlan = await IntentClient.evaluateIntent(
           {
             user_id: userId,
@@ -525,7 +527,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           ws.send(JSON.stringify(responsePayload));
           logger.info({ requestId, taskId, responsePayload }, "Sent AI planner directive to Android");
           if (responsePayload.is_completed) {
-            taskContexts.delete(taskId);
+            sessionContexts.delete(sessionId);
           }
         }
       } catch (err: any) {
