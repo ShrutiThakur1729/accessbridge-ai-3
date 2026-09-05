@@ -93,6 +93,10 @@ class ActionPlanResponse(BaseModel):
     session_language: Optional[str] = Field(default=None, description="BCP-47 language for the client TTS response")
     execution_state: Optional[str] = Field(default=None, description="Planner state-machine state")
     approach: Optional[str] = Field(default=None, description="LOCAL_RESOLUTION or SERVER_REPLANNING")
+    context_mode: str = Field(
+        default="DEFAULT",
+        description="Active UI context, such as DEFAULT, IN_DIALOG_PICKER, FORM_FILLING, or SEARCH_ACTIVE",
+    )
 
     @field_validator("risk_level", mode="before")
     @classmethod
@@ -111,7 +115,8 @@ class ActionPlanResponse(BaseModel):
                 "plan_id": "plan_9901a",
                 "user_goal": "Send $50 to Alice on Venmo",
                 "risk_level": "RED",
-                "total_steps": 2,
+                "total_steps": 1,
+                "context_mode": "DEFAULT",
                 "steps": [
                     {
                         "step_id": 1,

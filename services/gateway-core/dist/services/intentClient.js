@@ -6,7 +6,8 @@ const logger_js_1 = require("../utils/logger.js");
 const TaskLockManager_js_1 = require("./TaskLockManager.js");
 class IntentClient {
     static async evaluateIntent(payload, requestId) {
-        const url = `${env_js_1.ENV.INTENT_SAFETY_URL}/plan`;
+        const rawUrl = String(env_js_1.ENV.INTENT_SAFETY_URL || "http://localhost:8000/api/v1").replace(/\/$/, "");
+        const url = rawUrl.endsWith("/plan") ? rawUrl : `${rawUrl}/plan`;
         const taskId = payload.task_id || requestId;
         const controller = TaskLockManager_js_1.taskLockManager.acquireLock(taskId);
         logger_js_1.logger.info({ requestId, url }, "Forwarding intent payload to Service 02");
@@ -44,12 +45,12 @@ class IntentClient {
 exports.IntentClient = IntentClient;
 class VisionClient {
     static async analyze(payload, requestId) {
-        const baseUrl = String(env_js_1.ENV.VISION_PERCEPTION_URL || "").replace(/\/$/, "");
-        if (!baseUrl || !payload.screenshot_base64) {
+        const rawUrl = String(env_js_1.ENV.VISION_PERCEPTION_URL || "http://localhost:8010/api/v1").replace(/\/$/, "");
+        if (!payload.screenshot_base64) {
             return null;
         }
-        const url = baseUrl.endsWith("/analyze") ? baseUrl : `${baseUrl}/analyze`;
-        logger_js_1.logger.info({ requestId, url, taskId: payload.task_id }, "Routing fallback screenshot to Service 03");
+        const url = rawUrl.endsWith("/analyze") ? rawUrl : `${rawUrl}/api/v1/analyze`;
+        logger_js_1.logger.info({ requestId, url, taskId: payload.task_id }, "Routing fallback screenshot to Service 04 Vision Perception");
         try {
             const response = await fetch(url, {
                 method: "POST",
@@ -63,15 +64,15 @@ class VisionClient {
             });
             if (!response.ok) {
                 const errorText = await response.text();
-                logger_js_1.logger.warn({ requestId, status: response.status, errorText }, "Service 03 analyze failed");
+                logger_js_1.logger.warn({ requestId, status: response.status, errorText }, "Service 04 analyze failed");
                 return null;
             }
             const data = (await response.json());
-            logger_js_1.logger.info({ requestId, taskId: payload.task_id, engine: data?.engine, detections: (data?.elements || []).length }, "Service 03 returned coordinate payload");
+            logger_js_1.logger.info({ requestId, taskId: payload.task_id, engine: data?.engine, detections: (data?.elements || []).length }, "Service 04 returned coordinate payload");
             return data;
         }
         catch (error) {
-            logger_js_1.logger.warn({ requestId, error: error?.message || String(error) }, "Service 03 unreachable");
+            logger_js_1.logger.warn({ requestId, error: error?.message || String(error) }, "Service 04 unreachable");
             return null;
         }
     }

@@ -97,10 +97,6 @@ function normalizeLanguage(value, fallback = "en-US") {
 function actionTypeFor(step) {
     return step ? (step.action_type || step.action) : "FINISH";
 }
-/**
- * Prunes non-actionable screen elements, soft-keyboard keys, and bloated visual properties
- * to drastically lower LLM token count and prevent TPM rate limits.
- */
 function compressScreenState(screenState) {
     if (!Array.isArray(screenState))
         return [];
@@ -111,20 +107,15 @@ function compressScreenState(screenState) {
         const className = String(node.class_name || node.className || "").toLowerCase();
         const viewId = String(node.view_id || node.viewId || "").toLowerCase();
         const text = String(node.text || node.content_description || node.contentDescription || "").trim();
-        // Retain actionable, editable, or nodes with meaningful text
         const isClickable = Boolean(node.is_clickable || node.isClickable || node.clickable || (node.tap_x != null && node.tap_y != null));
         const isEditable = Boolean(node.is_editable || node.isEditable || node.editable);
-        // Never prune actionable controls, including one-character controls and
-        // in-app fields that only expose a view ID.
         if (isClickable || isEditable || text.length > 0)
             return true;
-        // Non-actionable keyboard/layout nodes add noise without aiding planning.
         if (className.includes("keyboard") || viewId.includes("keyboard"))
             return false;
         return false;
     })
         .slice(0, 45)
-        // Strip non-essential layout attributes (bounds, class names, focus state, etc.)
         .map((node) => {
         const cleanNode = {};
         const text = String(node.text || "").trim();
@@ -152,12 +143,7 @@ function compressScreenState(screenState) {
     return filtered;
 }
 function setupWebSocketServer(wss) {
-    // Task context is deliberately keyed by Android's task_id, not a transient
-    // WebSocket connection ID, so execution can continue after reconnecting.
-    const taskContexts = new Map();
-    // ------------------------------------------------------------------
-    // 1. WebSocket Heartbeat Ping-Pong Mechanism (Prevents Timeouts)
-    // ------------------------------------------------------------------
+    const sessionContexts = new Map();
     const pingInterval = setInterval(() => {
         wss.clients.forEach((ws) => {
             if (ws.isAlive === false) {
@@ -179,10 +165,6 @@ function setupWebSocketServer(wss) {
             ws.isAlive = true;
         });
         logger_js_1.logger.info({ clientId, clientIp }, "Client connected via WebSocket");
-        // Binary WebSocket frames have no task metadata. The Android client sends a
-        // HYBRID_AUDIO_START JSON frame first, then chunks, then HYBRID_AUDIO_END.
-        // One recorder is active per accessibility session, so one pending stream per
-        // socket is intentional and prevents chunks from crossing task boundaries.
         let pendingHybridAudio;
         const sendHybridFallback = (taskId, error) => {
             if (ws.readyState === ws_1.WebSocket.OPEN) {
@@ -256,7 +238,6 @@ function setupWebSocketServer(wss) {
                     hybridPayload = true;
                 }
                 else if (typeof parsedMessage.audio_base64 === "string") {
-                    // Also support a single JSON frame for short recordings/files.
                     const rawBase64 = parsedMessage.audio_base64.replace(/^data:[^;]+;base64,/, "").trim();
                     if (!rawBase64 || !/^[A-Za-z0-9+/]*={0,2}$/.test(rawBase64)) {
                         throw new HybridPayloadError("AUDIO_CORRUPT", "Voice payload is not valid base64 audio.");
@@ -274,8 +255,6 @@ function setupWebSocketServer(wss) {
                     try {
                         const sttResult = await sttClient_js_1.SttClient.transcribe(audioBuffer, String(parsedMessage.audio_mime_type || parsedMessage.mime_type || "audio/webm"));
                         parsedMessage.transcript = sttResult.transcript;
-                        // Explicit client metadata wins when supplied; otherwise preserve the
-                        // language detected by STT for the entire session.
                         parsedMessage.session_language = parsedMessage.session_language || parsedMessage.language_code || sttResult.language;
                     }
                     catch (error) {
@@ -285,15 +264,36 @@ function setupWebSocketServer(wss) {
                         throw error;
                     }
                 }
-                // Extract multi-turn protocol fields sent from Android
                 const taskId = parsedMessage.task_id || `task_${crypto_1.default.randomUUID().slice(0, 8)}`;
                 const sessionId = String(parsedMessage.session_id || parsedMessage.sessionId || taskId);
                 const messageType = parsedMessage.message_type === "USER_INTENT_FEEDBACK" || parsedMessage.type === "USER_INTENT_FEEDBACK"
                     ? "USER_INTENT_FEEDBACK"
                     : "USER_INTENT";
-                const providedTranscript = String(parsedMessage.transcript || parsedMessage.original_intent || "").trim();
-                const storedContext = taskContexts.get(taskId);
+                const providedTranscript = String(parsedMessage.transcript || parsedMessage.user_prompt || parsedMessage.original_intent || "").trim();
+                const storedContext = sessionContexts.get(sessionId);
                 const transcript = providedTranscript || storedContext?.transcript || "";
+                if (!transcript && messageType === "USER_INTENT") {
+                    logger_js_1.logger.warn({ taskId, requestId }, "Received USER_INTENT with empty transcript. Aborting call to AI Planner.");
+                    if (ws.readyState === ws_1.WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            task_id: taskId,
+                            session_id: sessionId,
+                            speech_response: "I didn't capture any speech. Please try speaking your command again.",
+                            action_type: "FINISH",
+                            target_text: "",
+                            package_name: "",
+                            text_to_type: "",
+                            scroll_direction: "",
+                            execution_mode: "ACCESSIBILITY",
+                            language_code: "en-US",
+                            execution_state: "ERROR",
+                            approach: "",
+                            error: "EMPTY_TRANSCRIPT",
+                            is_completed: true,
+                        }));
+                    }
+                    return;
+                }
                 const userId = parsedMessage.user_id || storedContext?.userId || "default_user";
                 const sessionLanguage = normalizeLanguage(parsedMessage.session_language || parsedMessage.sessionLanguage || parsedMessage.language_code, storedContext?.sessionLanguage || "en-US");
                 const taskContext = storedContext || {
@@ -302,7 +302,11 @@ function setupWebSocketServer(wss) {
                     sessionId,
                     sessionLanguage,
                     actionHistory: [],
+                    blacklistMemory: [],
                 };
+                if (!taskContext.blacklistMemory) {
+                    taskContext.blacklistMemory = [];
+                }
                 if (providedTranscript) {
                     taskContext.transcript = providedTranscript;
                     taskContext.userId = userId;
@@ -311,7 +315,7 @@ function setupWebSocketServer(wss) {
                 taskContext.sessionLanguage = sessionLanguage;
                 const nestedScreen = nestedScreenObject(parsedMessage);
                 const screenState = extractScreenNodes(parsedMessage);
-                const actionStatus = parsedMessage.action_status || parsedMessage.actionStatus || "INITIAL";
+                const actionStatus = String(parsedMessage.action_status || parsedMessage.actionStatus || parsedMessage.status || "INITIAL");
                 const currentPackageName = String(parsedMessage.current_package_name ||
                     parsedMessage.current_app_package ||
                     parsedMessage.current_package ||
@@ -330,21 +334,126 @@ function setupWebSocketServer(wss) {
                     "").trim();
                 const originalElementsCount = Array.isArray(screenState) ? screenState.length : 0;
                 const executedAction = parsedMessage.target_action || parsedMessage.action_type || parsedMessage.action;
+                // Populate complete Action History details for target blacklisting in planner_service.py
                 if (executedAction && actionStatus.toUpperCase() !== "INITIAL") {
                     taskContext.actionHistory.push({
                         action_type: String(executedAction),
+                        target_node: parsedMessage.target_node || undefined,
+                        target_text: parsedMessage.target_text || undefined,
                         package_name: parsedMessage.package_name || parsedMessage.target_package || undefined,
                         status: actionStatus.toUpperCase(),
                     });
                 }
-                taskContexts.set(taskId, taskContext);
-                // Compress screen state nodes before forwarding to Python Service 02
+                const rawStatus = String(parsedMessage.status || parsedMessage.action_status || parsedMessage.actionStatus || "").toUpperCase();
+                if (rawStatus === "LOOP_DETECTED" || String(actionStatus).toUpperCase() === "LOOP_DETECTED") {
+                    const actionType = String(executedAction || parsedMessage.action_type || parsedMessage.action || "SCROLL").trim();
+                    const targetText = String(parsedMessage.target_text || parsedMessage.target_node || "").trim();
+                    const fallbackStr = `${actionType}_${targetText || "rescan_wait"}`;
+                    const targetActionStr = String(parsedMessage.targetActionStr || parsedMessage.target_action_str || fallbackStr).trim();
+                    const lastTargetNode = String(parsedMessage.target_node || parsedMessage.target_text || "").trim();
+                    const isPassiveDelay = /rescan_wait|scroll/i.test(targetActionStr) || /rescan_wait|scroll/i.test(lastTargetNode);
+                    if (!isPassiveDelay) {
+                        if (targetActionStr && targetActionStr !== "" && !taskContext.blacklistMemory.includes(targetActionStr)) {
+                            taskContext.blacklistMemory.push(targetActionStr);
+                        }
+                        if (lastTargetNode && lastTargetNode !== "" && !taskContext.blacklistMemory.includes(lastTargetNode)) {
+                            taskContext.blacklistMemory.push(lastTargetNode);
+                        }
+                    }
+                    logger_js_1.logger.warn({ requestId, taskId, sessionId, targetActionStr, isPassiveDelay, blacklistMemory: taskContext.blacklistMemory }, "LOOP_DETECTED feedback received: processed session blacklist memory");
+                }
+                sessionContexts.set(sessionId, taskContext);
                 const compressedScreenState = compressScreenState(screenState);
                 const screenshotBase64 = screenshotFrom(parsedMessage);
                 let visionElements = Array.isArray(parsedMessage.vision_elements) ? parsedMessage.vision_elements : [];
                 if (shouldRouteToVision(compressedScreenState, screenshotBase64, parsedMessage)) {
-                    const visionPayload = await intentClient_js_1.VisionClient.analyze({ screenshot_base64: screenshotBase64, task_id: taskId, query_text: transcript }, requestId);
-                    visionElements = visionNodesFrom(visionPayload);
+                    try {
+                        const visionPayload = await intentClient_js_1.VisionClient.analyze({ screenshot_base64: screenshotBase64, task_id: taskId, query_text: transcript }, requestId);
+                        visionElements = visionNodesFrom(visionPayload);
+                    }
+                    catch (vErr) {
+                        logger_js_1.logger.warn({ requestId, taskId, error: vErr.message }, "Vision perception call failed or timed out");
+                    }
+                }
+                // 0-Element Escalation Chain handling
+                if (visionElements.length > 0) {
+                    taskContext.zeroElementAttempts = 0;
+                }
+                else if (originalElementsCount === 0) {
+                    taskContext.zeroElementAttempts = (taskContext.zeroElementAttempts || 0) + 1;
+                    if (taskContext.zeroElementAttempts >= 3) {
+                        logger_js_1.logger.warn({ requestId, taskId, sessionId, zeroElementAttempts: taskContext.zeroElementAttempts }, "[0-Element Escalation] Attempt >= 3: Screen unresponsive. Emitting HARD_STOP.");
+                        const responsePayload = {
+                            task_id: taskId,
+                            session_id: sessionId,
+                            language_code: sessionLanguage,
+                            execution_state: "ERROR",
+                            approach: "SAFETY_INTERCEPT",
+                            speech_response: "Screen unresponsive.",
+                            action_type: "HARD_STOP",
+                            target_text: "",
+                            package_name: "",
+                            text_to_type: "",
+                            scroll_direction: "",
+                            execution_mode: "ACCESSIBILITY",
+                            error: "Screen unresponsive",
+                            is_completed: true,
+                        };
+                        if (ws.readyState === ws_1.WebSocket.OPEN) {
+                            ws.send(JSON.stringify(responsePayload));
+                            sessionContexts.delete(sessionId);
+                        }
+                        return;
+                    }
+                    if (taskContext.zeroElementAttempts === 2) {
+                        logger_js_1.logger.warn({ requestId, taskId, sessionId, zeroElementAttempts: taskContext.zeroElementAttempts }, "[0-Element Escalation] Attempt 2: Vision returned 0 elements. Issuing SYSTEM_BACK overlay clear.");
+                        const responsePayload = {
+                            task_id: taskId,
+                            session_id: sessionId,
+                            language_code: sessionLanguage,
+                            execution_state: "EXECUTING",
+                            approach: "SAFETY_INTERCEPT",
+                            speech_response: "Screen unresponsive. Clearing overlay.",
+                            action_type: "SYSTEM_BACK",
+                            target_text: "",
+                            package_name: "",
+                            text_to_type: "",
+                            scroll_direction: "",
+                            execution_mode: "SYSTEM_INTENT",
+                            error: "",
+                            is_completed: false,
+                        };
+                        if (ws.readyState === ws_1.WebSocket.OPEN) {
+                            ws.send(JSON.stringify(responsePayload));
+                        }
+                        return;
+                    }
+                    if (taskContext.zeroElementAttempts === 1) {
+                        logger_js_1.logger.warn({ requestId, taskId, sessionId, zeroElementAttempts: taskContext.zeroElementAttempts }, "[0-Element Escalation] Attempt 1: 0 elements detected. Requesting rescan/screenshot.");
+                        const responsePayload = {
+                            task_id: taskId,
+                            session_id: sessionId,
+                            language_code: sessionLanguage,
+                            execution_state: "EXECUTING",
+                            approach: "SERVER_REPLANNING",
+                            speech_response: "Rescanning screen state...",
+                            action_type: "SCROLL",
+                            target_text: "rescan_wait",
+                            package_name: "",
+                            text_to_type: "",
+                            scroll_direction: "",
+                            execution_mode: "ACCESSIBILITY",
+                            error: "",
+                            is_completed: false,
+                        };
+                        if (ws.readyState === ws_1.WebSocket.OPEN) {
+                            ws.send(JSON.stringify(responsePayload));
+                        }
+                        return;
+                    }
+                }
+                else {
+                    taskContext.zeroElementAttempts = 0;
                 }
                 logger_js_1.logger.info({
                     requestId,
@@ -358,7 +467,6 @@ function setupWebSocketServer(wss) {
                     visionElementsCount: visionElements.length,
                     screenshotPresent: Boolean(screenshotBase64),
                 }, "Compressed screen state and querying Python AI Planner");
-                // Call Service 02 (Python FastAPI Planner) via IntentClient
                 const aiPlan = await intentClient_js_1.IntentClient.evaluateIntent({
                     user_id: userId,
                     task_id: taskId,
@@ -372,9 +480,8 @@ function setupWebSocketServer(wss) {
                     failure_reason: parsedMessage.failure_reason || parsedMessage.error_message || "",
                     execution_attempt: Number(parsedMessage.execution_attempt || 0),
                     input_type: "TEXT",
+                    user_prompt: transcript,
                     text_prompt: transcript,
-                    // Send the canonical fields used by the Phase 1 planner schema while
-                    // retaining the legacy package name for older Service 02 deployments.
                     current_package_name: currentPackageName,
                     current_app_package: currentPackageName,
                     active_input_focused: activeInputFocused,
@@ -383,8 +490,8 @@ function setupWebSocketServer(wss) {
                     screenshot_base64: screenshotBase64 || undefined,
                     vision_elements: visionElements,
                     action_history: taskContext.actionHistory,
+                    blacklist_memory: taskContext.blacklistMemory,
                 }, requestId);
-                // Map the current Python planner step to the Android action protocol format
                 const currentStepIndex = aiPlan.current_step_index || 0;
                 const currentStep = aiPlan.steps && aiPlan.steps.length > currentStepIndex ? aiPlan.steps[currentStepIndex] : null;
                 const prematureCompletion = aiPlan.is_completed === true &&
@@ -423,7 +530,7 @@ function setupWebSocketServer(wss) {
                     ws.send(JSON.stringify(responsePayload));
                     logger_js_1.logger.info({ requestId, taskId, responsePayload }, "Sent AI planner directive to Android");
                     if (responsePayload.is_completed) {
-                        taskContexts.delete(taskId);
+                        sessionContexts.delete(sessionId);
                     }
                 }
             }

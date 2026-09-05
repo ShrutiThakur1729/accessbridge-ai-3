@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.schemas.request import PlannerRequest
 from app.schemas.action_plan import ActionPlanResponse, ActionType, RiskLevel
-from app.services.planner_service import planner_service
+from app.services.planner import planner_service
 from app.services.safety_service import SafetyService
 from app.services.conversation_state import (
     PlannerExecutionState,
@@ -151,6 +151,7 @@ async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
         session_language=session_language,
         screenshot_base64=request.screenshot_base64,
         vision_elements=request.vision_elements,
+        blacklist_memory=request.blacklist_memory,
     )
 
     return dispatch_plan(plan, user_prompt, session_id, session_language, request.message_type)

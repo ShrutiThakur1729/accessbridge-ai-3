@@ -35,6 +35,8 @@ interface TaskContext {
   sessionId: string;
   sessionLanguage: string;
   actionHistory: ActionHistoryEntry[];
+  blacklistMemory: string[];
+  zeroElementAttempts?: number;
 }
 
 interface PendingHybridAudio {
@@ -375,7 +377,11 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           sessionId,
           sessionLanguage,
           actionHistory: [],
+          blacklistMemory: [],
         };
+        if (!taskContext.blacklistMemory) {
+          taskContext.blacklistMemory = [];
+        }
         if (providedTranscript) {
           taskContext.transcript = providedTranscript;
           taskContext.userId = userId;
@@ -384,7 +390,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
         taskContext.sessionLanguage = sessionLanguage;
         const nestedScreen = nestedScreenObject(parsedMessage);
         const screenState = extractScreenNodes(parsedMessage);
-        const actionStatus = parsedMessage.action_status || parsedMessage.actionStatus || "INITIAL";
+        const actionStatus = String(parsedMessage.action_status || parsedMessage.actionStatus || parsedMessage.status || "INITIAL");
         const currentPackageName = String(
           parsedMessage.current_package_name ||
             parsedMessage.current_app_package ||
@@ -420,6 +426,30 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             status: actionStatus.toUpperCase(),
           });
         }
+
+        const rawStatus = String(parsedMessage.status || parsedMessage.action_status || parsedMessage.actionStatus || "").toUpperCase();
+        if (rawStatus === "LOOP_DETECTED" || String(actionStatus).toUpperCase() === "LOOP_DETECTED") {
+          const actionType = String(executedAction || parsedMessage.action_type || parsedMessage.action || "SCROLL").trim();
+          const targetText = String(parsedMessage.target_text || parsedMessage.target_node || "").trim();
+          const fallbackStr = `${actionType}_${targetText || "rescan_wait"}`;
+          const targetActionStr = String(parsedMessage.targetActionStr || parsedMessage.target_action_str || fallbackStr).trim();
+          const lastTargetNode = String(parsedMessage.target_node || parsedMessage.target_text || "").trim();
+
+          const isPassiveDelay = /rescan_wait|scroll/i.test(targetActionStr) || /rescan_wait|scroll/i.test(lastTargetNode);
+          if (!isPassiveDelay) {
+            if (targetActionStr && targetActionStr !== "" && !taskContext.blacklistMemory.includes(targetActionStr)) {
+              taskContext.blacklistMemory.push(targetActionStr);
+            }
+            if (lastTargetNode && lastTargetNode !== "" && !taskContext.blacklistMemory.includes(lastTargetNode)) {
+              taskContext.blacklistMemory.push(lastTargetNode);
+            }
+          }
+          logger.warn(
+            { requestId, taskId, sessionId, targetActionStr, isPassiveDelay, blacklistMemory: taskContext.blacklistMemory },
+            "LOOP_DETECTED feedback received: processed session blacklist memory"
+          );
+        }
+
         sessionContexts.set(sessionId, taskContext);
 
         const compressedScreenState = compressScreenState(screenState);
@@ -427,11 +457,106 @@ export function setupWebSocketServer(wss: WebSocketServer) {
         let visionElements = Array.isArray(parsedMessage.vision_elements) ? parsedMessage.vision_elements : [];
 
         if (shouldRouteToVision(compressedScreenState, screenshotBase64, parsedMessage)) {
-          const visionPayload = await VisionClient.analyze(
-            { screenshot_base64: screenshotBase64, task_id: taskId, query_text: transcript },
-            requestId
-          );
-          visionElements = visionNodesFrom(visionPayload);
+          try {
+            const visionPayload = await VisionClient.analyze(
+              { screenshot_base64: screenshotBase64, task_id: taskId, query_text: transcript },
+              requestId
+            );
+            visionElements = visionNodesFrom(visionPayload);
+          } catch (vErr: any) {
+            logger.warn({ requestId, taskId, error: vErr.message }, "Vision perception call failed or timed out");
+          }
+        }
+
+        // 0-Element Escalation Chain handling
+        if (visionElements.length > 0) {
+          taskContext.zeroElementAttempts = 0;
+        } else if (originalElementsCount === 0) {
+          taskContext.zeroElementAttempts = (taskContext.zeroElementAttempts || 0) + 1;
+
+          if (taskContext.zeroElementAttempts >= 3) {
+            logger.warn(
+              { requestId, taskId, sessionId, zeroElementAttempts: taskContext.zeroElementAttempts },
+              "[0-Element Escalation] Attempt >= 3: Screen unresponsive. Emitting HARD_STOP."
+            );
+            const responsePayload: ResponsePayload = {
+              task_id: taskId,
+              session_id: sessionId,
+              language_code: sessionLanguage,
+              execution_state: "ERROR",
+              approach: "SAFETY_INTERCEPT",
+              speech_response: "Screen unresponsive.",
+              action_type: "HARD_STOP",
+              target_text: "",
+              package_name: "",
+              text_to_type: "",
+              scroll_direction: "",
+              execution_mode: "ACCESSIBILITY",
+              error: "Screen unresponsive",
+              is_completed: true,
+            };
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify(responsePayload));
+              sessionContexts.delete(sessionId);
+            }
+            return;
+          }
+
+          if (taskContext.zeroElementAttempts === 2) {
+            logger.warn(
+              { requestId, taskId, sessionId, zeroElementAttempts: taskContext.zeroElementAttempts },
+              "[0-Element Escalation] Attempt 2: Vision returned 0 elements. Issuing SYSTEM_BACK overlay clear."
+            );
+            const responsePayload: ResponsePayload = {
+              task_id: taskId,
+              session_id: sessionId,
+              language_code: sessionLanguage,
+              execution_state: "EXECUTING",
+              approach: "SAFETY_INTERCEPT",
+              speech_response: "Screen unresponsive. Clearing overlay.",
+              action_type: "SYSTEM_BACK",
+              target_text: "",
+              package_name: "",
+              text_to_type: "",
+              scroll_direction: "",
+              execution_mode: "SYSTEM_INTENT",
+              error: "",
+              is_completed: false,
+            };
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify(responsePayload));
+            }
+            return;
+          }
+
+          if (taskContext.zeroElementAttempts === 1) {
+            logger.warn(
+              { requestId, taskId, sessionId, zeroElementAttempts: taskContext.zeroElementAttempts },
+              "[0-Element Escalation] Attempt 1: 0 elements detected. Requesting rescan/screenshot."
+            );
+            const responsePayload: ResponsePayload = {
+              task_id: taskId,
+              session_id: sessionId,
+              language_code: sessionLanguage,
+              execution_state: "EXECUTING",
+              approach: "SERVER_REPLANNING",
+              speech_response: "Rescanning screen state...",
+              action_type: "SCROLL",
+              target_text: "rescan_wait",
+              package_name: "",
+              text_to_type: "",
+              scroll_direction: "",
+              execution_mode: "ACCESSIBILITY",
+              error: "",
+              is_completed: false,
+            };
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify(responsePayload));
+            }
+            return;
+          }
+        } else {
+          taskContext.zeroElementAttempts = 0;
         }
 
         logger.info(
@@ -474,6 +599,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             screenshot_base64: screenshotBase64 || undefined,
             vision_elements: visionElements,
             action_history: taskContext.actionHistory,
+            blacklist_memory: taskContext.blacklistMemory,
           },
           requestId
         );

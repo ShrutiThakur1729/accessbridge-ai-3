@@ -85,8 +85,8 @@ class WebSocketManager(
         if (payload.optString("type") == "USER_INTENT") {
             val transcript = payload.optString("transcript")
             val userPrompt = payload.optString("user_prompt")
-            if (transcript.isEmpty() || userPrompt.isEmpty()) {
-                Log.w("WebSocketManager", "Aborting send: USER_INTENT has empty transcript or user_prompt.")
+            if (transcript.isBlank() || userPrompt.isBlank()) {
+                Log.w("WebSocketManager", "Aborting send: USER_INTENT has empty/blank transcript or user_prompt.")
                 return false
             }
         }

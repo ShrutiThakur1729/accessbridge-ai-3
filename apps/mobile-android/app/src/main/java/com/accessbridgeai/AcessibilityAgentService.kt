@@ -200,6 +200,10 @@ class AccessibilityAgentService : AccessibilityService() {
     fun testOfflineDomCompression() {
         serviceScope.launch {
             Log.d("AccessibilityAgent", "Running offline Phase 1 DOM extraction test...")
+            
+            // Post-Transition Settle Delay for screen capture
+            delay(1200)
+
             val screenState = captureScreenStateWithRetry()
             val payload = JSONObject().apply {
                 put("type", "OFFLINE_TEST")
@@ -216,8 +220,12 @@ class AccessibilityAgentService : AccessibilityService() {
         currentTaskId = taskId
         currentOriginalIntent = transcript
         executionAttempts.clear()
+        LoopDetector.clearHistory()
         
         serviceScope.launch {
+            // Post-Transition Settle Delay for screen capture (Initial Intent)
+            delay(1200)
+
             val screenState = captureScreenStateWithRetry()
             val payload = JSONObject().apply {
                 put("type", "USER_INTENT")
@@ -290,6 +298,28 @@ class AccessibilityAgentService : AccessibilityService() {
                 }
 
                 Log.d("AccessibilityAgent", "Processing directive: $actionType, task_id: $currentTaskId")
+
+                // Local Loop Detection
+                if (actionType == "CLICK" || actionType == "TYPE_TEXT") {
+                    val currentScreenState = captureScreenStateWithRetry()
+                    val elements = currentScreenState.optJSONArray("screenElements") ?: JSONArray()
+                    val domHash = LoopDetector.calculateDomHash(elements)
+                    
+                    if (LoopDetector.isLoopDetected(packageName ?: "", domHash, actionType, targetText ?: "", elements.length())) {
+                        Log.e("AccessibilityAgent", "LOOP DETECTED: Action $actionType on $targetText with same DOM state (3x sequential).")
+                        val loopPayload = JSONObject().apply {
+                            put("type", "USER_INTENT_FEEDBACK")
+                            put("task_id", currentTaskId ?: "")
+                            put("action_status", "FAILED")
+                            put("status", "LOOP_DETECTED")
+                            put("failure_reason", "Execution loop detected locally (3x sequential actionable intent).")
+                            put("timestamp", System.currentTimeMillis())
+                        }
+                        sendPayload(loopPayload)
+                        return@launch
+                    }
+                    LoopDetector.recordAction(packageName ?: "", domHash, actionType, targetText ?: "", elements.length())
+                }
 
                 // Interceptor for Biometric Authentication
                 if (requiresBiometric || actionType == "CONFIRM_BIOMETRIC") {
@@ -715,29 +745,15 @@ class AccessibilityAgentService : AccessibilityService() {
             }
         }
 
-        // 4. Final Fallback: Home screen search (Triggered only if direct intent-based launches fail)
+        // 4. Final Fallback: App Drawer Search (Deterministic 2-step state machine)
         if (!appName.isNullOrBlank()) {
-            Log.d("AccessibilityAgent", "Intent-based launch failed. Attempting Home search for '$appName'.")
+            Log.d("AccessibilityAgent", "Intent-based launch failed. Triggering App Drawer fallback for '$appName'.")
             
             val taskToFinalize = currentTaskId
             val originalIntentToFinalize = currentOriginalIntent
 
             serviceScope.launch {
-                performGlobalAction(GLOBAL_ACTION_HOME)
-                delay(1000) // Debounce for Home transition
-                
-                val clickResult = clickElementByText(appName)
-                
-                sendFeedbackAfterAction(
-                    result = clickResult,
-                    actionType = "OPEN_APP",
-                    targetNode = appName,
-                    targetPackage = clickResult.packageLaunched ?: targetPackage,
-                    immediate = false,
-                    debounce = !clickResult.success,
-                    capturedTaskId = taskToFinalize,
-                    capturedOriginalIntent = originalIntentToFinalize
-                )
+                runAppDrawerFallback(appName, taskToFinalize, originalIntentToFinalize)
             }
             return ActionResult(true, "HOME_FALLBACK_STARTED")
         }
@@ -810,8 +826,143 @@ class AccessibilityAgentService : AccessibilityService() {
         return success
     }
 
+    private suspend fun runAppDrawerFallback(appName: String, taskId: String?, originalIntent: String?) {
+        Log.d("AccessibilityAgent", "Running deterministic App Drawer Fallback for '$appName'")
+        
+        // 1. Global Home
+        performGlobalAction(GLOBAL_ACTION_HOME)
+        delay(1000) 
+        
+        // 2. Swipe Up to open Drawer
+        swipeUpToOpenDrawer()
+        delay(1000) // Wait for drawer animation
+        
+        // 3. Locate Search Bar
+        val searchBox = findAppDrawerSearchBox()
+        
+        val finalResult = if (searchBox != null) {
+            // 4. Inject App Name
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, appName)
+            }
+            val setSuccess = searchBox.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+            if (setSuccess) {
+                delay(500)
+                // 5. Dispatch IME search
+                triggerSearchAction(searchBox)
+                delay(1200) // Wait for results to populate
+                
+                // 6. Click first search result (prioritize nodes that are NOT the search box)
+                clickSearchResult(appName, searchBox)
+            } else {
+                ActionResult(false, "ACTION_FAILED", "Failed to set text in search box")
+            }
+        } else {
+            Log.e("AccessibilityAgent", "Could not find search box in App Drawer")
+            // Try direct click on home screen as a last-ditch effort
+            clickElementByText(appName)
+        }
+        
+        searchBox?.recycle()
+        
+        sendFeedbackAfterAction(
+            result = finalResult,
+            actionType = "OPEN_APP",
+            targetNode = appName,
+            immediate = false,
+            debounce = !finalResult.success,
+            capturedTaskId = taskId,
+            capturedOriginalIntent = originalIntent
+        )
+    }
+
+    private fun clickSearchResult(appName: String, searchBox: AccessibilityNodeInfo): ActionResult {
+        val windows = windows
+        val target = appName.lowercase()
+        
+        for (window in windows) {
+            val root = window.root ?: continue
+            val result = recursiveSearchAndClickResult(root, target, searchBox)
+            root.recycle()
+            if (result.success) return result
+        }
+        
+        return ActionResult(false, "NODE_MISSING", "Could not find app result for '$appName' in search results")
+    }
+
+    private fun recursiveSearchAndClickResult(node: AccessibilityNodeInfo, target: String, exclude: AccessibilityNodeInfo): ActionResult {
+        if (node != exclude) {
+            val text = node.text?.toString()?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            if (text.contains(target) || desc.contains(target)) {
+                val clickRes = attemptClickRich(node)
+                if (clickRes.success) return clickRes
+            }
+        }
+        
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val res = recursiveSearchAndClickResult(child, target, exclude)
+            child.recycle()
+            if (res.success) return res
+        }
+        return ActionResult(false, "NODE_MISSING")
+    }
+
+    private fun findSearchableNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val text = node.text?.toString()?.lowercase() ?: ""
+        val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            node.hintText?.toString()?.lowercase() ?: ""
+        } else ""
+        
+        val viewId = node.viewIdResourceName ?: ""
+        
+        if (node.isEditable && (
+            text.contains("search") || 
+            hint.contains("search") || 
+            viewId.contains("search_box_input") ||
+            viewId.contains("search_src_text")
+        )) {
+            return AccessibilityNodeInfo.obtain(node)
+        }
+        
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val found = findSearchableNode(child)
+            child.recycle()
+            if (found != null) return found
+        }
+        return null
+    }
+
+    private fun findAppDrawerSearchBox(): AccessibilityNodeInfo? {
+        val root = rootInActiveWindow ?: return null
+        val commonIds = listOf(
+            "com.google.android.apps.nexuslauncher:id/search_container_all_apps",
+            "com.google.android.googlequicksearchbox:id/googleapp_search_box",
+            "com.android.launcher3:id/search_container_all_apps",
+            "search_box_input",
+            "search_src_text",
+            "search_bar"
+        )
+        
+        for (id in commonIds) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (nodes.isNotEmpty()) {
+                val found = AccessibilityNodeInfo.obtain(nodes[0])
+                nodes.forEach { it.recycle() }
+                root.recycle()
+                return found
+            }
+        }
+        
+        val searchable = findSearchableNode(root)
+        root.recycle()
+        return searchable
+    }
+
     // 3. Type text into the currently focused or first available editable field
-    fun typeTextIntoFocusedNode(textToType: String): ActionResult {
+    suspend fun typeTextIntoFocusedNode(textToType: String): ActionResult {
         val windows = windows
         var targetNode: AccessibilityNodeInfo? = null
 
@@ -845,8 +996,14 @@ class AccessibilityAgentService : AccessibilityService() {
             }
             val success = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
             if (success) {
-                Log.d("AccessibilityAgent", "Successfully injected text. Triggering search IME action...")
+                Log.d("AccessibilityAgent", "Successfully injected text. Waiting for settlement...")
+                
+                // Short delay to allow OS/App to register the text input buffer
+                delay(150)
+                
+                Log.d("AccessibilityAgent", "Triggering search IME action...")
                 triggerSearchAction(targetNode)
+                
                 val context = getNodeContext(targetNode)
                 targetNode.recycle()
                 ActionResult(true, "SUCCESS", nodeContext = context)
@@ -862,20 +1019,43 @@ class AccessibilityAgentService : AccessibilityService() {
         }
     }
 
-    private fun triggerSearchAction(node: AccessibilityNodeInfo) {
-        // Strategy 1: Look for a search/go/enter button in all windows
+    private suspend fun triggerSearchAction(node: AccessibilityNodeInfo) {
+        // Strategy 0: Direct Key Event dispatch via shell (Most reliable for IME Enter)
+        val enterSuccess = try {
+            val process = Runtime.getRuntime().exec("input keyevent 66")
+            process.waitFor()
+            true
+        } catch (e: Exception) {
+            false
+        }
+        
+        if (enterSuccess) {
+            Log.d("AccessibilityAgent", "IME Enter submitted via adb shell keyevent 66")
+            return
+        }
+
+        // Strategy 1: Use native ACTION_IME_ENTER if available (API 30+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val imeResult = node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            if (imeResult) {
+                Log.d("AccessibilityAgent", "IME Search submitted via ACTION_IME_ENTER")
+                return
+            }
+        }
+
+        // Strategy 2: Look for a search/go/enter button in all windows
         val windows = windows
         for (window in windows) {
             val root = window.root ?: continue
             if (searchForImeButton(root)) {
+                Log.d("AccessibilityAgent", "IME Search submitted via UI Button click")
                 root.recycle()
                 return
             }
             root.recycle()
         }
         
-        // Strategy 2: If no button found, attempt to click the node again to trigger soft keyboard submission
-        // (Some apps submit on Enter key press which might be triggered by a click/focus cycle)
+        // Strategy 3: Fallback click to trigger listeners
         node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
     }
 
@@ -973,12 +1153,23 @@ class AccessibilityAgentService : AccessibilityService() {
         capturedOriginalIntent: String? = currentOriginalIntent
     ) {
         serviceScope.launch {
+            // Mandatory Post-Action UI Settlement Window
+            val settleDelay = when (actionType) {
+                "OPEN_APP", "SWIPE_UP" -> 1200L
+                "CLICK", "TYPE_TEXT" -> 600L
+                else -> 0L
+            }
+            if (settleDelay > 0) {
+                Log.d("AccessibilityAgent", "Applying mandatory ${settleDelay}ms UI settlement delay for $actionType")
+                delay(settleDelay)
+            }
+
             if (debounce) {
-                Log.d("AccessibilityAgent", "Debouncing feedback payload by 1200ms to allow UI settlement...")
+                Log.d("AccessibilityAgent", "Debouncing feedback payload by an additional 1200ms...")
                 delay(1200)
             }
 
-            if (!immediate) {
+            if (!immediate && actionType != "OPEN_APP" && actionType != "SWIPE_UP" && actionType != "CLICK" && actionType != "TYPE_TEXT") {
                 // Wait for UI to settle: either by event or timeout
                 windowChangeDeferred = CompletableDeferred()
                 withTimeoutOrNull(2000) {
@@ -986,7 +1177,7 @@ class AccessibilityAgentService : AccessibilityService() {
                 }
                 windowChangeDeferred = null
                 
-                // Requirement: Wait at least 600ms for TYPE_WINDOW_STATE_CHANGED settlement or animations
+                // Fallback for other non-specific actions
                 delay(600)
             }
             
@@ -1063,6 +1254,23 @@ class AccessibilityAgentService : AccessibilityService() {
         
         // Initial debounce/delay for UI settlement after action
         delay(500)
+
+        // Window Settle Verification for empty DOM trees:
+        // retry fetching rootInActiveWindow up to 3 times with a 150ms delay
+        // if it yields 0 child elements (originalElementsCount: 0), ensuring apps have fully rendered their UI.
+        var windowSettleRetries = 3
+        while (windowSettleRetries > 0) {
+            val root = rootInActiveWindow
+            val originalElementsCount = root?.childCount ?: 0
+            if (root != null && originalElementsCount > 0) {
+                root.recycle()
+                break
+            }
+            root?.recycle()
+            Log.d("AccessibilityAgent", "rootInActiveWindow is null or has 0 children (originalElementsCount: $originalElementsCount), retrying settle... ($windowSettleRetries left)")
+            delay(200)
+            windowSettleRetries--
+        }
 
         while (retries > 0) {
             val currentBatch = JSONArray()
@@ -1268,15 +1476,16 @@ class AccessibilityAgentService : AccessibilityService() {
     }
 
     private fun traverseAndExtract(rootNode: AccessibilityNodeInfo, array: JSONArray) {
-        val stack = mutableListOf<AccessibilityNodeInfo>()
-        stack.add(AccessibilityNodeInfo.obtain(rootNode))
+        // We use a stack of Pairs: the node and its nearest clickable ancestor's JSON representation
+        val stack = mutableListOf<Pair<AccessibilityNodeInfo, JSONObject?>>()
+        stack.add(AccessibilityNodeInfo.obtain(rootNode) to null)
 
         while (stack.isNotEmpty()) {
-            val node = stack.removeAt(stack.size - 1)
+            val (node, clickableParent) = stack.removeAt(stack.size - 1)
+            
+            // 1. SYSTEM UI & VISIBILITY FILTERING
             val nodePackage = node.packageName?.toString() ?: ""
-
-            // 1. SYSTEM UI FILTERING - Skip nodes from SystemUI or overlays
-            if (nodePackage.contains("com.android.systemui", ignoreCase = true)) {
+            if (nodePackage.contains("com.android.systemui", ignoreCase = true) || !node.isVisibleToUser) {
                 node.recycle()
                 continue
             }
@@ -1295,38 +1504,72 @@ class AccessibilityAgentService : AccessibilityService() {
                 }
             }
 
-            val nodeObj = JSONObject().apply {
-                put("text", node.text?.toString() ?: "")
-                put("content_description", node.contentDescription?.toString() ?: "")
-                put("resource_id", node.viewIdResourceName ?: "")
-                put("class_name", node.className?.toString() ?: "")
-                put("package_name", nodePackage)
-                put("isClickable", node.isClickable)
-                put("isEditable", node.isEditable)
-                put("isFocused", node.isFocused)
-                put("isScrollable", node.isScrollable)
-                put("isVisible", node.isVisibleToUser)
-                put("isEnabled", node.isEnabled)
-                put("isChecked", node.isChecked)
-                put("isSelected", node.isSelected)
+            // 3. PARENT-NODE COLLAPSING LOGIC
+            var nextClickableParent = clickableParent
+            var shouldCreateNode = true
 
-                val bounds = Rect()
-                node.getBoundsInScreen(bounds)
-                // Use standard [left,top][right,bottom] or explicit keys for backend clarity
-                put("bounds", JSONObject().apply {
-                    put("left", bounds.left)
-                    put("top", bounds.top)
-                    put("right", bounds.right)
-                    put("bottom", bounds.bottom)
-                })
+            // If we are inside a clickable parent and this node is NOT editable, collapse it.
+            // This ensures list rows, buttons with icons, and combined elements are treated as single units.
+            if (clickableParent != null && !node.isEditable) {
+                val nodeText = node.text?.toString()?.trim() ?: ""
+                val nodeDesc = node.contentDescription?.toString()?.trim() ?: ""
+                
+                if (nodeText.isNotEmpty() || nodeDesc.isNotEmpty()) {
+                    val currentText = clickableParent.optString("text", "").trim()
+                    val currentDesc = clickableParent.optString("content_description", "").trim()
+                    
+                    if (nodeText.isNotEmpty() && !currentText.contains(nodeText)) {
+                        val newText = if (currentText.isEmpty()) nodeText else "$currentText $nodeText"
+                        clickableParent.put("text", newText)
+                    }
+                    if (nodeDesc.isNotEmpty() && !currentDesc.contains(nodeDesc)) {
+                        val newDesc = if (currentDesc.isEmpty()) nodeDesc else "$currentDesc $nodeDesc"
+                        clickableParent.put("content_description", newDesc)
+                    }
+                }
+                // Skip creating a separate node entry for this child to keep DOM lean and focused
+                shouldCreateNode = false
             }
-            array.put(nodeObj)
 
+            if (shouldCreateNode) {
+                val nodeObj = JSONObject().apply {
+                    put("text", node.text?.toString() ?: "")
+                    put("content_description", node.contentDescription?.toString() ?: "")
+                    put("resource_id", node.viewIdResourceName ?: "")
+                    put("class_name", node.className?.toString() ?: "")
+                    put("package_name", nodePackage)
+                    put("isClickable", node.isClickable)
+                    put("isEditable", node.isEditable)
+                    put("isFocused", node.isFocused)
+                    put("isScrollable", node.isScrollable)
+                    put("isVisible", node.isVisibleToUser)
+                    put("isEnabled", node.isEnabled)
+                    put("isChecked", node.isChecked)
+                    put("isSelected", node.isSelected)
+
+                    val bounds = Rect()
+                    node.getBoundsInScreen(bounds)
+                    put("bounds", JSONObject().apply {
+                        put("left", bounds.left)
+                        put("top", bounds.top)
+                        put("right", bounds.right)
+                        put("bottom", bounds.bottom)
+                    })
+                }
+                array.put(nodeObj)
+                
+                // If this new node is clickable, it becomes the parent context for its descendants
+                if (node.isClickable) {
+                    nextClickableParent = nodeObj
+                }
+            }
+
+            // 4. DFS RECURSION
             // Add children to stack in reverse order to maintain DFS left-to-right order
             for (i in node.childCount - 1 downTo 0) {
                 val child = node.getChild(i)
                 if (child != null) {
-                    stack.add(child)
+                    stack.add(child to nextClickableParent)
                 }
             }
             node.recycle()

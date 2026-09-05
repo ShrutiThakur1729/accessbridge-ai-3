@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.schemas.action_plan import ActionType, RiskLevel, WaterfallTier, ActionPlanResponse, PlanStep
 from app.services.safety_service import SafetyService
-from app.services.planner_service import PlannerService, planner_service
+from app.services.planner import PlannerService, planner_service
 
 
 class TestPhase4SafetyVisionAndAppLaunch(unittest.TestCase):

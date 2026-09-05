@@ -61,6 +61,11 @@ class PlannerRequest(BaseModel):
         description="Historical trace of executed actions for loop detection",
         validation_alias=AliasChoices("action_history", "actionHistory"),
     )
+    blacklist_memory: List[str] = Field(
+        default_factory=list,
+        description="Blacklisted target/action strings from loop detection",
+        validation_alias=AliasChoices("blacklist_memory", "blacklistMemory", "blacklisted_targets"),
+    )
     message_type: str = Field(
         default="USER_INTENT",
         description="Protocol message type: USER_INTENT or USER_INTENT_FEEDBACK",

@@ -61,6 +61,7 @@ export interface IntentRequestPayload {
   screenshot_base64?: string;
   vision_elements?: any[];
   action_history?: ActionHistoryEntry[];
+  blacklist_memory?: string[];
 }
 
 export interface IntentPlanResponse {
