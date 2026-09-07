@@ -1,7 +1,8 @@
-#The orchestrator
+# The orchestrator
 import re
 import uuid
 from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
 
 from app.schemas.action_plan import ActionPlanResponse, ActionType, PlanStep, RiskLevel, WaterfallTier
 from app.services.safety_service import SafetyService
@@ -10,11 +11,9 @@ from app.utils.screen_compressor import compress_screen_state
 
 from app.services.planner.utils import sanitize_text
 from app.services.planner.ui_topology import (
-    classify_ui_topology, detect_context_mode, node_target_label, node_text, node_is_editable, node_is_clickable
     classify_ui_topology, detect_context_mode, node_target_label, node_text, node_is_editable, node_is_clickable,
-    find_best_app_match
+    find_best_app_match, group_spatial_nodes
 )
-from app.services.planner.entity_extractor import extract_clean_entity, extract_intent_payloads
 from app.services.planner.entity_extractor import extract_clean_entity, extract_intent_payloads, normalize_app_query
 from app.services.planner.state_guards import (
     dismiss_overlay_if_present, handle_post_contact_selection, prioritize_unadjusted_parameter_control
@@ -24,6 +23,65 @@ from app.services.planner.app_drawer_handler import (
     is_app_foreground
 )
 from app.services.planner.llm_client import LLMPlannerClient
+from app.services.conversation_state import conversation_state_manager, PlannerExecutionState
+
+
+@dataclass
+class SessionContext:
+    user_id: str
+    session_id: str
+    active_package: Optional[str] = None
+    primary_goal: Optional[str] = None
+    pending_state: Optional[str] = None
+    pending_target: Optional[str] = None
+    conversation_history: List[Dict[str, str]] = field(default_factory=list)
+
+    def add_turn(self, role: str, text: str, max_history: int = 10) -> None:
+        if text and text.strip():
+            self.conversation_history.append({"role": role, "text": text.strip()})
+            if len(self.conversation_history) > max_history:
+                self.conversation_history = self.conversation_history[-max_history:]
+
+
+def classify_intent_metadata(user_prompt: str) -> Dict[str, Any]:
+    prompt_raw = user_prompt.strip().lower()
+    
+    # Single-Word Verb Safety Check (e.g., "open", "launch", "start")
+    if prompt_raw in {"open", "launch", "start", "go to", "turn on", "show"}:
+        return {
+            "primary_intent": "AMBIGUOUS_LAUNCH",
+            "target_app": None,
+            "has_subsequent_actions": False,
+        }
+
+    app_info = resolve_app_launch(user_prompt)
+    if not app_info:
+        return {
+            "primary_intent": "GENERAL_ACTION",
+            "target_app": None,
+            "has_subsequent_actions": True,
+        }
+
+    pkg, fallback_pkg, app_name = app_info
+
+    # Pure launch verbs check
+    pure_launch_match = re.match(
+        rf"^(?:open|launch|go\s+to|start|turn\s+on|show)\s+{re.escape(app_name.lower())}(?:\s+(?:app|application))?$",
+        prompt_raw
+    )
+    if pure_launch_match or prompt_raw in {app_name.lower(), f"{app_name.lower()} app", f"{app_name.lower()} application"}:
+        return {
+            "primary_intent": "LAUNCH_APP",
+            "target_app": app_name,
+            "has_subsequent_actions": False,
+        }
+
+    return {
+        "primary_intent": "LAUNCH_APP",
+        "target_app": app_name,
+        "has_subsequent_actions": True,
+    }
+
 
 class PlannerService:
     def __init__(self):
@@ -31,7 +89,30 @@ class PlannerService:
         self._task_failure_counts: Dict[str, Dict[str, int]] = {}
         self._app_drawer_searches: Dict[str, str] = {}
         self._pending_install_intents: Dict[str, str] = {}
+        self._pending_app_confirmations: Dict[str, str] = {}
         self._bottom_sheet_blacklists: Dict[str, set[str]] = {}
+        self._session_states: Dict[str, str] = {}
+        self._session_contexts: Dict[str, SessionContext] = {}
+
+    def _get_or_create_session(self, user_id: str, session_id: str) -> SessionContext:
+        clean_user = sanitize_text(user_id) or "anonymous"
+        clean_session = sanitize_text(session_id) or "default_session"
+        key = f"{clean_user}:{clean_session}"
+
+        stored_session = conversation_state_manager.get(key)
+        if stored_session and stored_session.session_context:
+            self._session_contexts[key] = stored_session.session_context
+
+        if key not in self._session_contexts:
+            self._session_contexts[key] = SessionContext(user_id=clean_user, session_id=clean_session)
+
+        ctx = self._session_contexts[key]
+        conversation_state_manager.transition(
+            session_id=key,
+            state=PlannerExecutionState.PROCESSING_DOM,
+            session_context=ctx
+        )
+        return ctx
 
     async def generate_plan(
         self,
@@ -49,11 +130,214 @@ class PlannerService:
         screenshot_base64: Optional[str] = None,
         vision_elements: Optional[List[Dict[str, Any]]] = None,
         blacklist_memory: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
     ) -> ActionPlanResponse:
         risk_level = SafetyService.evaluate_risk(user_prompt)
         screen_state = list(screen_state or [])
+        
+        # Persistent memory key based on session_id instead of task_id
+        effective_session_id = session_id or task_id or "default_session"
+        session_key = f"{sanitize_text(user_id) or 'anonymous'}:{sanitize_text(effective_session_id)}"
+        
+        session_ctx = self._get_or_create_session(user_id or "anonymous", effective_session_id)
+        session_ctx.add_turn("user", user_prompt)
+        if current_app_package:
+            session_ctx.active_package = current_app_package
+
+        affirmative_regex = r"\b(?:yes|sure|install|open|ok|okay|yeah|yep|do it|please|go ahead)\b"
+
+        def attach_session_metadata(plan: ActionPlanResponse) -> ActionPlanResponse:
+            """Ensure session_id and updated conversation history are attached to response."""
+            if plan.speech_response:
+                session_ctx.add_turn("assistant", plan.speech_response)
+            return plan.model_copy(update={
+                "session_id": session_ctx.session_id,
+                "conversation_history": list(session_ctx.conversation_history)
+            })
+
+        # =========================================================================
+        # FIX 1: PENDING CONTEXT PRIORITY ROUTING (EVALUATED BEFORE CLASSIFICATION)
+        # =========================================================================
+        
+        # 0A. Pending Ambiguous App Confirmation Flow
+        pending_ambiguous_app = self._pending_app_confirmations.get(session_key)
+        if pending_ambiguous_app:
+            if re.search(affirmative_regex, user_prompt, re.IGNORECASE):
+                candidate_app = self._pending_app_confirmations.pop(session_key, None) or pending_ambiguous_app
+                return attach_session_metadata(ActionPlanResponse(
+                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                    session_id=session_ctx.session_id,
+                    user_goal=user_prompt,
+                    risk_level=risk_level,
+                    total_steps=1,
+                    current_step_index=0,
+                    is_completed=False,
+                    speech_response=f"Opening {candidate_app}.",
+                    steps=[PlanStep(
+                        step_id=1,
+                        action=ActionType.CLICK,
+                        target_node=candidate_app,
+                        target_text=candidate_app,
+                        tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                        reason=f"Ambiguous app confirmation: opening confirmed app '{candidate_app}'.",
+                    )],
+                ))
+            else:
+                self._pending_app_confirmations.pop(session_key, None)
+                return attach_session_metadata(ActionPlanResponse(
+                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                    session_id=session_ctx.session_id,
+                    user_goal=user_prompt,
+                    risk_level=risk_level,
+                    total_steps=1,
+                    current_step_index=0,
+                    is_completed=True,
+                    speech_response="Cancelled app launch.",
+                    steps=[PlanStep(
+                        step_id=1,
+                        action=ActionType.FINISH,
+                        reason="User cancelled opening ambiguous candidate app.",
+                    )],
+                ))
+
+        # 0B. Pending Play Store Install Confirmation Flow
+        pending_install_app = self._pending_install_intents.get(session_key)
+        if pending_install_app:
+            if re.search(affirmative_regex, user_prompt, re.IGNORECASE):
+                app_name = self._pending_install_intents.pop(session_key, None) or pending_install_app
+                return attach_session_metadata(ActionPlanResponse(
+                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                    session_id=session_ctx.session_id,
+                    user_goal=user_prompt,
+                    risk_level=risk_level,
+                    total_steps=3,
+                    current_step_index=0,
+                    is_completed=False,
+                    speech_response=f"Installing {app_name} from Google Play Store.",
+                    steps=[
+                        PlanStep(
+                            step_id=1,
+                            action=ActionType.OPEN_APP,
+                            target_node="com.android.vending",
+                            target_text="Google Play Store",
+                            package_name="com.android.vending",
+                            tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                            reason="Play Store installation: opening Google Play Store.",
+                        ),
+                        PlanStep(
+                            step_id=2,
+                            action=ActionType.TYPE_TEXT,
+                            target_node="Search Google Play",
+                            target_text="Search Google Play",
+                            input_data=f"Search apps for {app_name}",
+                            tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                            reason=f"Play Store installation: typing search query for {app_name}.",
+                        ),
+                        PlanStep(
+                            step_id=3,
+                            action=ActionType.CLICK,
+                            target_node="Install",
+                            target_text="Install",
+                            tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                            reason=f"Play Store installation: clicking Install for {app_name}.",
+                        ),
+                    ],
+                ))
+            else:
+                self._pending_install_intents.pop(session_key, None)
+                return attach_session_metadata(ActionPlanResponse(
+                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                    session_id=session_ctx.session_id,
+                    user_goal=user_prompt,
+                    risk_level=risk_level,
+                    total_steps=1,
+                    current_step_index=0,
+                    is_completed=True,
+                    speech_response="Cancelled Play Store installation.",
+                    steps=[
+                        PlanStep(
+                            step_id=1,
+                            action=ActionType.FINISH,
+                            reason="User cancelled Play Store installation.",
+                        )
+                    ],
+                ))
+
+        # 0C. Universal Screen QA Interceptor
+        qa_keywords = ("what", "which", "how much", "tell me", "read screen", "summarize", "options", "cheapest", "show options")
+        prompt_lower = user_prompt.lower()
+        is_qa = any(kw in prompt_lower for kw in qa_keywords) and not any(action_kw in prompt_lower for action_kw in ("open ", "launch ", "click ", "type ", "send ", "install "))
+        if is_qa:
+            grouped = group_spatial_nodes(screen_state)
+            if grouped:
+                labels = [g.get("combined_label") for g in grouped if g.get("combined_label")]
+                summary = "; ".join(labels[:5])
+                speech = f"On screen options: {summary}."
+            else:
+                speech = "Inspected on-screen contents. No interactive options detected."
+            return attach_session_metadata(ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                session_id=session_ctx.session_id,
+                user_goal=user_prompt,
+                risk_level=RiskLevel.GREEN,
+                total_steps=1,
+                current_step_index=0,
+                is_completed=False,
+                execution_state="PAUSE_FOR_USER_INPUT",
+                speech_response=speech,
+                steps=[PlanStep(
+                    step_id=1,
+                    action=ActionType.PAUSE_FOR_USER_INPUT,
+                    reason="Universal Screen QA: answered visual inquiry and paused for user input.",
+                )],
+            ))
+
+        # =========================================================================
+        # INTENT CLASSIFICATION & SAFETY GUARDS
+        # =========================================================================
+        intent_meta = classify_intent_metadata(user_prompt)
+
+        # Single-Word Verb Prompt Safety Guard
+        if intent_meta["primary_intent"] == "AMBIGUOUS_LAUNCH":
+            return attach_session_metadata(ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                session_id=session_ctx.session_id,
+                user_goal=user_prompt,
+                risk_level=risk_level,
+                total_steps=1,
+                current_step_index=0,
+                is_completed=True,
+                execution_state="AWAITING_USER_INPUT",
+                speech_response="Which application would you like me to open?",
+                steps=[PlanStep(
+                    step_id=1,
+                    action=ActionType.FINISH,
+                    reason="Single-word launch verb detected without target app entity; requesting clarification.",
+                )],
+            ))
+
+        # Universal Pre-Plan Foreground Package Lock Guard
+        if intent_meta["primary_intent"] == "LAUNCH_APP" and not intent_meta["has_subsequent_actions"]:
+            if is_app_foreground(current_app_package, user_prompt):
+                target_app = intent_meta["target_app"] or "Application"
+                return attach_session_metadata(ActionPlanResponse(
+                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                    session_id=session_ctx.session_id,
+                    user_goal=user_prompt,
+                    risk_level=risk_level,
+                    total_steps=1,
+                    current_step_index=0,
+                    is_completed=True,
+                    execution_state="COMPLETED",
+                    speech_response=f"{target_app} is open.",
+                    steps=[PlanStep(
+                        step_id=1,
+                        action=ActionType.FINISH,
+                        reason="Pre-Plan Package Lock Guard: Target application is active in foreground; pure launch request satisfied.",
+                    )],
+                ))
+
         context_mode = detect_context_mode(screen_state)
-        session_key = f"{sanitize_text(user_id) or 'anonymous'}:{sanitize_text(task_id) or 'default'}"
         action_history = action_history or []
 
         last_action = ""
@@ -63,7 +347,6 @@ class PlannerService:
 
         def finalize(plan: ActionPlanResponse) -> ActionPlanResponse:
             """Emit executable action plan for this controller turn."""
-            # Hard Package Lock Guard: Prevent OPEN_APP when requested app is already in foreground
             if is_app_foreground(current_app_package, user_prompt):
                 sanitized_steps = []
                 for step in plan.steps:
@@ -104,8 +387,19 @@ class PlannerService:
                         sanitized_steps.append(step)
                 plan = plan.model_copy(update={"steps": sanitized_steps})
 
+            # Apply Universal 3-Tier Safety Intercept
+            tier, explanation = SafetyService.classify_universal_tier(user_prompt, plan, screen_state)
+            if tier == "TIER_C":
+                takeover = SafetyService.build_user_takeover_plan(user_prompt, explanation or "Sensitive operation detected.", plan)
+                return attach_session_metadata(takeover)
+            elif tier == "TIER_B":
+                plan = plan.model_copy(update={
+                    "requires_confirmation": True,
+                    "execution_state": plan.execution_state or "AWAITING_USER_CONFIRMATION"
+                })
+
             if len(plan.steps) > 1:
-                return plan.model_copy(update={"context_mode": context_mode})
+                return attach_session_metadata(plan.model_copy(update={"context_mode": context_mode}))
             step_index = plan.current_step_index
             if not 0 <= step_index < len(plan.steps):
                 step_index = 0
@@ -114,57 +408,12 @@ class PlannerService:
                 if plan.steps
                 else PlanStep(step_id=1, action=ActionType.FINISH)
             )
-            return plan.model_copy(update={
+            return attach_session_metadata(plan.model_copy(update={
                 "steps": [step],
                 "total_steps": 1,
                 "current_step_index": 0,
                 "context_mode": context_mode,
-            })
-
-        # 0. Pending Play Store Install Confirmation Flow
-        pending_install_app = self._pending_install_intents.get(session_key)
-        if pending_install_app:
-            if re.search(r"\b(?:yes|sure|install|ok|okay|yeah|do it|yep|please|go ahead)\b", user_prompt, re.IGNORECASE):
-                app_name = self._pending_install_intents.pop(session_key, None) or pending_install_app
-                return finalize(ActionPlanResponse(
-                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
-                    user_goal=user_prompt,
-                    risk_level=risk_level,
-                    total_steps=3,
-                    current_step_index=0,
-                    is_completed=False,
-                    speech_response=f"Installing {app_name} from Google Play Store.",
-                    steps=[
-                        PlanStep(
-                            step_id=1,
-                            action=ActionType.OPEN_APP,
-                            target_node="com.android.vending",
-                            target_text="Google Play Store",
-                            package_name="com.android.vending",
-                            tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                            reason="Play Store installation: opening Google Play Store.",
-                        ),
-                        PlanStep(
-                            step_id=2,
-                            action=ActionType.TYPE_TEXT,
-                            target_node="Search Google Play",
-                            target_text="Search Google Play",
-                            input_data=f"Search apps for {app_name}",
-                            tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                            reason=f"Play Store installation: typing search query for {app_name}.",
-                        ),
-                        PlanStep(
-                            step_id=3,
-                            action=ActionType.CLICK,
-                            target_node="Install",
-                            target_text="Install",
-                            tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                            reason=f"Play Store installation: clicking Install for {app_name}.",
-                        ),
-                    ],
-                ))
-            else:
-                self._pending_install_intents.pop(session_key, None)
+            }))
 
         # 0.1 Loop Detection Recovery Guard
         if str(action_status).upper() == "LOOP_DETECTED":
@@ -231,7 +480,7 @@ class PlannerService:
                     )]
                 ))
 
-        # 0.2 Foreground Action Failure Guard (action_status == FAILED when foregrounded)
+        # 0.2 Foreground Action Failure Guard
         if is_app_foreground(current_app_package, user_prompt) and str(action_status).upper() == "FAILED":
             failed_targets = set()
             if target_action:
@@ -297,98 +546,6 @@ class PlannerService:
                     )]
                 ))
 
-        # App Drawer Search Results Evaluation
-        query = self._app_drawer_searches.get(session_key) or (
-            extract_app_name_for_search(user_prompt)
-            if (last_action in {"TYPE_TEXT", "SWIPE_UP"} or looks_like_launcher_or_app_drawer(current_app_package, screen_state))
-            else None
-        )
-        if query and (last_action in {"TYPE_TEXT", "SWIPE_UP"} or looks_like_launcher_or_app_drawer(current_app_package, screen_state)):
-            topology = classify_ui_topology(screen_state)
-            list_items = topology.get("LIST_ITEM_ZONE", [])
-            query_lower = query.lower()
-
-            # Dynamic Prefix/Substring Matching
-            # Dynamic Prefix/Substring & Phonetic Fuzzy Matching
-            candidates = normalize_app_query(query)
-            item_labels = [node_target_label(item) or node_text(item) for item in list_items if isinstance(item, dict) and node_is_clickable(item)]
-            best_match_label = find_best_app_match(candidates, item_labels)
-
-            matching_item = None
-            for item in list_items:
-                if not isinstance(item, dict) or not node_is_clickable(item):
-                    continue
-                item_label = (node_target_label(item) or node_text(item)).lower()
-                if query_lower in item_label or item_label in query_lower:
-                    matching_item = item
-                    break
-            if best_match_label:
-                matching_item = next((item for item in list_items if isinstance(item, dict) and (node_target_label(item) or node_text(item)) == best_match_label), None)
-            else:
-                for item in list_items:
-                    if not isinstance(item, dict) or not node_is_clickable(item):
-                        continue
-                    item_label = (node_target_label(item) or node_text(item)).lower()
-                    if query_lower in item_label or item_label in query_lower:
-                        matching_item = item
-                        break
-
-            if matching_item:
-                target = node_target_label(matching_item)
-                return finalize(ActionPlanResponse(
-                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
-                    user_goal=user_prompt,
-                    risk_level=risk_level,
-                    total_steps=1,
-                    is_completed=False,
-                    speech_response=f"Found matching app '{target}'. Launching.",
-                    steps=[PlanStep(
-                        step_id=1,
-                        action=ActionType.CLICK,
-                        target_node=target,
-                        target_text=target,
-                        tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                        reason=f"App Drawer search result match: clicking {target}.",
-                    )]
-                ))
-            elif len(list_items) > 0:
-                # Target position (1) (top result item)
-                top_item = list_items[0]
-                target = node_target_label(top_item)
-                return finalize(ActionPlanResponse(
-                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
-                    user_goal=user_prompt,
-                    risk_level=risk_level,
-                    total_steps=1,
-                    is_completed=False,
-                    speech_response=f"Selecting top search result '{target}'.",
-                    steps=[PlanStep(
-                        step_id=1,
-                        action=ActionType.CLICK,
-                        target_node=target,
-                        target_text=target,
-                        tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                        reason="App Drawer search fallback: selecting top result item.",
-                    )]
-                ))
-            elif last_action == "TYPE_TEXT" or len(screen_state) == 0:
-                # Zero results in App Drawer -> Play Store Install Confirmation Flow
-                app_name = extract_app_name_for_search(user_prompt) or query
-                self._pending_install_intents[session_key] = app_name
-                return finalize(ActionPlanResponse(
-                    plan_id=f"plan_{uuid.uuid4().hex[:8]}",
-                    user_goal=user_prompt,
-                    risk_level=risk_level,
-                    total_steps=1,
-                    is_completed=True,
-                    speech_response=f"The app '{app_name}' is not installed on your phone. Would you like me to install it from the Play Store?",
-                    steps=[PlanStep(
-                        step_id=1,
-                        action=ActionType.FINISH,
-                        reason="App not installed: prompting user for Play Store installation confirmation.",
-                    )]
-                ))
-
         # Empty screen state recovery guard
         if len(screen_state) == 0:
             if is_app_foreground(current_app_package, user_prompt):
@@ -434,7 +591,8 @@ class PlannerService:
         # 1. Recovery Guards
         app_drawer_recovery = handle_app_drawer_recovery(
             user_prompt, screen_state, risk_level, action_status, target_action,
-            current_app_package, session_key, self._app_drawer_searches, action_history
+            current_app_package, session_key, self._app_drawer_searches, action_history,
+            self._pending_install_intents, self._session_states, self._pending_app_confirmations
         )
         if app_drawer_recovery:
             return finalize(app_drawer_recovery)

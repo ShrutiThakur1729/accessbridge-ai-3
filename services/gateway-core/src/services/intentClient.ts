@@ -12,6 +12,8 @@ export type PlannerActionType =
   | "CONFIRM_BIOMETRIC"
   | "SYSTEM_BACK"
   | "GO_HOME_AND_SEARCH"
+  | "PAUSE_FOR_USER_INPUT"
+  | "USER_TAKE_OVER"
   | "FINISH"
   | "HARD_STOP";
 
@@ -71,7 +73,10 @@ export interface IntentPlanResponse {
   error?: string;
   session_language?: string;
   execution_state?: string;
+  requires_confirmation?: boolean;
   approach?: string;
+  thought_process?: string;
+  updated_session_state?: Record<string, any>;
   steps?: PlannerDirective[];
 }
 
@@ -160,7 +165,7 @@ export class VisionClient {
       );
       return data;
     } catch (error) {
-      logger.warn({ requestId, error: (error as any)?.message || String(error) }, "Service 04 unreachable");
+      logger.warn({ requestId, error: (error as any)?.maessage || String(error) }, "Service 04 unreachable");
       return null;
     }
   }

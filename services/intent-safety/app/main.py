@@ -152,6 +152,7 @@ async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
         screenshot_base64=request.screenshot_base64,
         vision_elements=request.vision_elements,
         blacklist_memory=request.blacklist_memory,
+        session_id=session_id,
     )
 
     return dispatch_plan(plan, user_prompt, session_id, session_language, request.message_type)

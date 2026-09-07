@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.LauncherApps
+import android.net.Uri
 import android.os.Build
 import android.os.UserHandle
 import android.os.UserManager
@@ -19,6 +20,13 @@ object LauncherAppResolver {
         NO_MATCH
     }
 
+    sealed class LaunchGatingResult {
+        data class SIMPLE_LAUNCH(val packageName: String, val appLabel: String, val componentName: ComponentName, val userHandle: UserHandle) : LaunchGatingResult()
+        data class AMBIGUOUS_LAUNCH(val candidates: List<MatchCandidate>) : LaunchGatingResult()
+        data class COMPLEX_INTENT(val packageName: String, val leftoverText: String) : LaunchGatingResult()
+        object NO_LOCAL_MATCH : LaunchGatingResult()
+    }
+
     data class ResolutionResult(
         val status: ResolutionStatus,
         val packageName: String? = null,
@@ -32,12 +40,120 @@ object LauncherAppResolver {
         return resolveApp(context, targetAppName, shouldLaunch)
     }
 
-    fun resolveApp(context: Context, appLabel: String, shouldLaunch: Boolean = true): ResolutionResult {
+    fun evaluateLaunchIntent(context: Context, rawTranscript: String): LaunchGatingResult {
+        val launchVerbRegex = Regex("^(open|launch|start|go to|show me|run)\\s+", RegexOption.IGNORE_CASE)
+        val cleanedTranscript = rawTranscript.replace(launchVerbRegex, "").trim()
+        
+        if (cleanedTranscript.isEmpty()) return LaunchGatingResult.NO_LOCAL_MATCH
+
+        val words = cleanedTranscript.split(Regex("\\s+"))
+        val candidate1 = words.getOrNull(0) ?: ""
+        val candidate2 = if (words.size >= 2) "${words[0]} ${words[1]}" else ""
+
         val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
         val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
         
+        val candidatesList = mutableListOf<MatchCandidate>()
+        var bestScore = 0.0
+
+        val profiles = userManager.userProfiles
+        for (profile in profiles) {
+            val activities = launcherApps.getActivityList(null, profile)
+            for (activity in activities) {
+                val label = activity.label.toString().lowercase().trim()
+                val isManaged = try {
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        userManager.isManagedProfile
+                    } else {
+                        profile != android.os.Process.myUserHandle()
+                    }
+                } catch (e: Exception) { false }
+                
+                // Check Candidate 1
+                val score1 = computeSimilarity(candidate1.lowercase(), label)
+                if (score1 >= 0.70) {
+                    candidatesList.add(MatchCandidate(score1, activity.componentName.packageName, activity.label.toString(), activity.componentName, profile, isManaged, candidate1))
+                    if (score1 > bestScore) bestScore = score1
+                }
+
+                // Check Candidate 2
+                if (candidate2.isNotEmpty()) {
+                    val score2 = computeSimilarity(candidate2.lowercase(), label)
+                    if (score2 >= 0.70) {
+                        candidatesList.add(MatchCandidate(score2, activity.componentName.packageName, activity.label.toString(), activity.componentName, profile, isManaged, candidate2))
+                        if (score2 > bestScore) bestScore = score2
+                    }
+                }
+            }
+        }
+
+        if (candidatesList.isNotEmpty()) {
+            val highConfidenceThreshold = maxOf(0.90, bestScore - 0.05)
+            val topCandidates = candidatesList.filter { it.score >= highConfidenceThreshold }
+                .distinctBy { "${it.packageName}_${it.userHandle}" }
+                .sortedByDescending { it.score }
+
+            if (topCandidates.size > 1) {
+                return LaunchGatingResult.AMBIGUOUS_LAUNCH(topCandidates.take(3))
+            }
+
+            val bestMatch = topCandidates[0]
+            val leftoverText = cleanedTranscript.substring(bestMatch.matchedQueryPart?.length ?: 0).trim()
+                .replace(Regex("^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$"), "") // Trim punctuation
+            
+            Log.d(TAG, "Gating Outcome: Best match '${bestMatch.label}' with score ${bestMatch.score}. Leftover Tokens: '$leftoverText'")
+            
+            return if (leftoverText.isEmpty()) {
+                LaunchGatingResult.SIMPLE_LAUNCH(
+                    bestMatch.packageName,
+                    bestMatch.label,
+                    bestMatch.componentName,
+                    bestMatch.userHandle
+                )
+            } else {
+                LaunchGatingResult.COMPLEX_INTENT(bestMatch.packageName, leftoverText)
+            }
+        }
+
+        Log.d(TAG, "Gating Outcome: NO_LOCAL_MATCH for '$cleanedTranscript'")
+        return LaunchGatingResult.NO_LOCAL_MATCH
+    }
+
+    fun resolveApp(context: Context, appLabel: String, shouldLaunch: Boolean = true): ResolutionResult {
+        // Tier 1: Exact Package Name Check (resolvePackageCache)
+        val packageManager = context.packageManager
+        val launchIntent = try {
+            packageManager.getLaunchIntentForPackage(appLabel)
+        } catch (e: Exception) {
+            null
+        }
+
+        if (launchIntent != null) {
+            val pkgInfo = try { packageManager.getPackageInfo(appLabel, 0) } catch (e: Exception) { null }
+            val label = pkgInfo?.applicationInfo?.loadLabel(packageManager)?.toString() ?: appLabel
+            val result = ResolutionResult(
+                ResolutionStatus.MATCH_FOUND,
+                appLabel,
+                label,
+                componentName = launchIntent.component,
+                userHandle = android.os.Process.myUserHandle()
+            )
+            if (shouldLaunch) {
+                try {
+                    context.startActivity(launchIntent.apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) })
+                } catch (e: Exception) {
+                    Log.e(TAG, "Tier 1 launch failed for $appLabel", e)
+                }
+            }
+            return result
+        }
+
+        // Tier 2: Dynamic Fuzzy & Phonetic Match
+        val launcherApps = context.getSystemService(Context.LAUNCHER_APPS_SERVICE) as LauncherApps
+        val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
+
         val targetLower = appLabel.lowercase().trim()
-        
+
         // Profile hint detection
         val isWorkRequest = targetLower.contains("work")
         val isPersonalRequest = targetLower.contains("personal") || targetLower.contains("private")
@@ -49,13 +165,10 @@ object LauncherAppResolver {
 
         val candidates = mutableListOf<MatchCandidate>()
 
-        // Scan all profiles: Personal, Work, Cloned
+        // Scan all profiles: Personal, Work, Cloned, Secure Folder
         val profiles = userManager.userProfiles
         for (profile in profiles) {
             val isManaged = if (Build.VERSION.SDK_INT >= 30) {
-                // UserManager.isManagedProfile(UserHandle) was added in API 30
-                // We use a reflective check to avoid compile-time issues if the IDE's SDK version is confused,
-                // or just rely on the fact that isManagedProfile() without args is for the calling user.
                 try {
                     val method = userManager.javaClass.getMethod("isManagedProfile", UserHandle::class.java)
                     method.invoke(userManager, profile) as Boolean
@@ -66,20 +179,20 @@ object LauncherAppResolver {
                 profile != android.os.Process.myUserHandle()
             }
             val activities = launcherApps.getActivityList(null, profile)
-            
+
             for (activity in activities) {
                 val label = activity.label.toString()
                 val pkg = activity.componentName.packageName
                 val labelLower = label.lowercase().trim()
-                
-                // Tier 1: Exact Match (Case-Insensitive)
-                val isExact = label.equals(appLabel, ignoreCase = true) || 
+
+                // Tier 1 logic inside Tier 2 loop for fuzzy matching
+                val isExact = label.equals(appLabel, ignoreCase = true) ||
                               pkg.equals(appLabel, ignoreCase = true) ||
                               labelLower == cleanTarget
 
                 var score = if (isExact) 1.0 else computeSimilarity(cleanTarget, labelLower)
-                
-                // Boost/Penalize score based on profile hints to ensure deterministic resolution
+
+                // Boost/Penalize score based on profile hints
                 if (isWorkRequest) {
                     if (isManaged) score = minOf(1.0, score + 0.15)
                     else score = maxOf(0.0, score - 0.3)
@@ -99,7 +212,13 @@ object LauncherAppResolver {
             }
         }
 
-        if (candidates.isEmpty()) return ResolutionResult(ResolutionStatus.NO_MATCH)
+        if (candidates.isEmpty()) {
+            // Tier 3: Play Store Fallback
+            if (shouldLaunch && cleanTarget.isNotEmpty()) {
+                launchPlayStoreSearch(context, cleanTarget)
+            }
+            return ResolutionResult(ResolutionStatus.NO_MATCH)
+        }
 
         // Sort candidates by score
         val sortedCandidates = candidates.sortedByDescending { it.score }
@@ -145,7 +264,31 @@ object LauncherAppResolver {
                 )
             }
             else -> {
+                // Tier 3: Play Store Fallback for low confidence
+                if (shouldLaunch && cleanTarget.isNotEmpty()) {
+                    launchPlayStoreSearch(context, cleanTarget)
+                }
                 ResolutionResult(ResolutionStatus.NO_MATCH)
+            }
+        }
+    }
+
+    private fun launchPlayStoreSearch(context: Context, query: String) {
+        try {
+            Log.d(TAG, "Tier 3: Launching Play Store search for '$query'")
+            val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("market://search?q=$query")).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Play Store search failed", e)
+            try {
+                val webIntent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://play.google.com/store/search?q=$query")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(webIntent)
+            } catch (e2: Exception) {
+                Log.e(TAG, "Web Play Store search failed", e2)
             }
         }
     }
@@ -161,13 +304,14 @@ object LauncherAppResolver {
         }
     }
 
-    private data class MatchCandidate(
+    data class MatchCandidate(
         val score: Double,
         val packageName: String,
         val label: String,
         val componentName: ComponentName,
         val userHandle: UserHandle,
-        val isManaged: Boolean
+        val isManaged: Boolean,
+        val matchedQueryPart: String? = null
     )
 
     private fun computeSimilarity(s1: String, s2: String): Double {
@@ -176,133 +320,22 @@ object LauncherAppResolver {
         val maxLength = max(s1.length, s2.length)
         val editScore = if (maxLength == 0) 1.0 else 1.0 - (levenshtein.toDouble() / maxLength)
         
-        // Phonetic Matching
+        // Phonetic Matching: Soundex
         val s1Soundex = soundex(s1)
         val s2Soundex = soundex(s2)
         
         // Exact Soundex match gives 1.0
         val soundexMatch = if (s1Soundex == s2Soundex && s1Soundex.isNotEmpty()) 1.0 else 0.0
         
-        // Double Metaphone logic
-        val dm1 = doubleMetaphone(s1)
-        val dm2 = doubleMetaphone(s2)
-        val metaphoneScore = when {
-            dm1.first == dm2.first -> 0.95
-            dm1.second == dm2.first && dm1.second != null -> 0.85
-            dm1.first == dm2.second && dm2.second != null -> 0.85
-            else -> 0.0
-        }
-        
-        // Combined Phonetic Score
-        val phoneticMatch = maxOf(soundexMatch, metaphoneScore)
-        
-        // Combined Score = max(Levenshtein Ratio, Phonetic Match Score)
-        return maxOf(editScore, phoneticMatch)
-    }
-
-    private fun doubleMetaphone(s: String): Pair<String, String?> {
-        if (s.isEmpty()) return "" to null
-        val input = s.uppercase().replace(Regex("[^A-Z]"), "")
-        if (input.isEmpty()) return "" to null
-
-        val primary = StringBuilder()
-        val secondary = StringBuilder()
-        var i = 0
-
-        while (i < input.length && (primary.length < 4 || secondary.length < 4)) {
-            val char = input[i]
-            when (char) {
-                'A', 'E', 'I', 'O', 'U', 'Y' -> {
-                    if (i == 0) {
-                        // Map all initial vowels and Y to a common code for phonetic flexibility (e.g., YouTube/UTube)
-                        primary.append('A')
-                        secondary.append('A')
-                    }
-                }
-                'B' -> { primary.append('P'); secondary.append('P') }
-                'C' -> {
-                    if (i + 1 < input.length && input[i + 1] == 'H') {
-                        primary.append('X'); secondary.append('X')
-                        i++
-                    } else if (i + 1 < input.length && (input[i + 1] == 'I' || input[i + 1] == 'E' || input[i + 1] == 'Y')) {
-                        primary.append('S'); secondary.append('S')
-                    } else {
-                        primary.append('K'); secondary.append('K')
-                    }
-                }
-                'D' -> { primary.append('T'); secondary.append('T') }
-                'F' -> { primary.append('F'); secondary.append('F') }
-                'G' -> {
-                    if (i + 1 < input.length && (input[i + 1] == 'E' || input[i + 1] == 'I' || input[i + 1] == 'Y')) {
-                        primary.append('J'); secondary.append('K')
-                    } else {
-                        primary.append('K'); secondary.append('K')
-                    }
-                }
-                'H' -> {}
-                'J' -> { primary.append('J'); secondary.append('J') }
-                'K' -> { primary.append('K'); secondary.append('K') }
-                'L' -> { primary.append('L'); secondary.append('L') }
-                'M' -> { primary.append('M'); secondary.append('M') }
-                'N' -> { primary.append('N'); secondary.append('N') }
-                'P' -> {
-                    if (i + 1 < input.length && input[i + 1] == 'H') {
-                        primary.append('F'); secondary.append('F')
-                        i++
-                    } else {
-                        primary.append('P'); secondary.append('P')
-                    }
-                }
-                'Q' -> { primary.append('K'); secondary.append('K') }
-                'R' -> { primary.append('R'); secondary.append('R') }
-                'S' -> {
-                    if (i + 1 < input.length && input[i + 1] == 'H') {
-                        primary.append('X'); secondary.append('X')
-                        i++
-                    } else {
-                        primary.append('S'); secondary.append('S')
-                    }
-                }
-                'T' -> {
-                    if (i + 1 < input.length && input[i + 1] == 'H') {
-                        primary.append('T'); secondary.append('T')
-                        i++
-                    } else {
-                        primary.append('T'); secondary.append('T')
-                    }
-                }
-                'V' -> { primary.append('F'); secondary.append('F') }
-                'W' -> {}
-                'X' -> { primary.append('K'); secondary.append('S') }
-                'Z' -> { primary.append('S'); secondary.append('S') }
-            }
-            i++
-        }
-        
-        val p = primary.toString().padEnd(4, ' ').substring(0, 4).trim()
-        val sAlt = secondary.toString().padEnd(4, ' ').substring(0, 4).trim()
-        
-        return p to (if (sAlt == p) null else sAlt)
-    }
-
-    private fun levenshteinDistance(s1: String, s2: String): Int {
-        val dp = Array(s1.length + 1) { IntArray(s2.length + 1) }
-        for (i in 0..s1.length) dp[i][0] = i
-        for (j in 0..s2.length) dp[0][j] = j
-        for (i in 1..s1.length) {
-            for (j in 1..s2.length) {
-                val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
-                dp[i][j] = minOf(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
-            }
-        }
-        return dp[s1.length][s2.length]
+        // Combined Score = max(Levenshtein Ratio, Soundex Match Score)
+        return maxOf(editScore, soundexMatch)
     }
 
     private fun soundex(s: String): String {
         if (s.isEmpty()) return ""
         val input = s.uppercase().replace(Regex("[^A-Z]"), "")
         if (input.isEmpty()) return ""
-        
+
         val res = StringBuilder().append(input[0])
         val mapping = mapOf(
             'B' to '1', 'F' to '1', 'P' to '1', 'V' to '1',
@@ -324,7 +357,20 @@ object LauncherAppResolver {
             }
             lastDigit = digit
         }
-        
+
         return res.toString().padEnd(4, '0').substring(0, 4)
+    }
+
+    private fun levenshteinDistance(s1: String, s2: String): Int {
+        val dp = Array(s1.length + 1) { IntArray(s2.length + 1) }
+        for (i in 0..s1.length) dp[i][0] = i
+        for (j in 0..s2.length) dp[0][j] = j
+        for (i in 1..s1.length) {
+            for (j in 1..s2.length) {
+                val cost = if (s1[i - 1] == s2[j - 1]) 0 else 1
+                dp[i][j] = minOf(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+            }
+        }
+        return dp[s1.length][s2.length]
     }
 }

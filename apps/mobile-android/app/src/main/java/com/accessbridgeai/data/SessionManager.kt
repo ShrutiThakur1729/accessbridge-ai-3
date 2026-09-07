@@ -3,6 +3,7 @@ package com.accessbridgeai.data
 import android.content.Context
 import android.content.SharedPreferences
 import com.google.gson.Gson
+import java.util.UUID
 
 class SessionManager(context: Context) {
     private val prefs: SharedPreferences = context.getSharedPreferences("access_bridge_prefs", Context.MODE_PRIVATE)
@@ -12,6 +13,7 @@ class SessionManager(context: Context) {
         private const val KEY_IS_LOGGED_IN = "is_logged_in"
         private const val KEY_USER_PROFILE = "user_profile"
         private const val KEY_SELECTED_LANGUAGE = "selected_language"
+        private const val KEY_SESSION_ID = "session_id"
     }
 
     var isLoggedIn: Boolean
@@ -38,6 +40,20 @@ class SessionManager(context: Context) {
 
     fun logout() {
         prefs.edit().clear().apply()
+    }
+
+    fun getSessionId(): String {
+        var sessionId = prefs.getString(KEY_SESSION_ID, null)
+        if (sessionId == null) {
+            sessionId = UUID.randomUUID().toString()
+            prefs.edit().putString(KEY_SESSION_ID, sessionId).apply()
+        }
+        return sessionId
+    }
+
+    fun resetSession() {
+        val newSessionId = UUID.randomUUID().toString()
+        prefs.edit().putString(KEY_SESSION_ID, newSessionId).apply()
     }
 }
 

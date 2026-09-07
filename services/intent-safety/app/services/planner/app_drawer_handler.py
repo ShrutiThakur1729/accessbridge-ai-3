@@ -1,10 +1,14 @@
-#Manages package resolutions and fallback operations for launcher and app drawer navigation.
+# Manages package resolutions and fallback operations for launcher and app drawer navigation.
 import re
 import uuid
 from typing import List, Dict, Any, Optional, Tuple
 from app.schemas.action_plan import ActionPlanResponse, ActionType, PlanStep, RiskLevel, WaterfallTier
 from app.services.planner.utils import sanitize_text
-from app.services.planner.ui_topology import classify_ui_topology, node_text, node_target_label, node_is_editable
+from app.services.planner.ui_topology import (
+    classify_ui_topology, node_text, node_target_label, node_is_editable, node_is_clickable,
+    find_best_app_match, find_best_app_match_with_score, is_launcher_utility_control
+)
+from app.services.planner.entity_extractor import normalize_app_query
 
 APP_PACKAGE_HINTS = {
     "whatsapp": ("com.whatsapp", None, "WhatsApp"),
@@ -32,7 +36,16 @@ APP_PACKAGE_HINTS = {
     "messages": ("com.google.android.apps.messaging", None, "Messages"),
     "phone": ("com.google.android.dialer", None, "Phone"),
     "settings": ("com.android.settings", None, "Settings"),
+    "blinkit": ("com.grofers.customerapp", "com.blinkit", "Blinkit"),
+    "savana": ("com.savana.android", "com.savana", "Savana"),
+    "zepto": ("com.zepto.app", "com.zepto", "Zepto"),
+    "zomato": ("com.application.zomato", "com.zomato", "Zomato"),
+    "hungama": ("com.hungama.myplay.activity", "com.hungama", "Hungama"),
 }
+
+EXCLUDED_LAUNCHER_UTILITY_TOKENS = (
+    "speak", "voice search", "mic", "google", "voice", "search apps"
+)
 
 def resolve_app_launch(user_prompt: str) -> Optional[Tuple[Optional[str], Optional[str], str]]:
     normalized_prompt = user_prompt.lower()
@@ -99,7 +112,42 @@ def handle_app_drawer_recovery(
     session_key: str,
     app_drawer_searches: Dict[str, str],
     action_history: Optional[List[Dict[str, Any]]] = None,
+    pending_install_intents: Optional[Dict[str, str]] = None,
+    session_states: Optional[Dict[str, str]] = None,
+    pending_app_confirmations: Optional[Dict[str, str]] = None,
 ) -> Optional[ActionPlanResponse]:
+    current_state = (session_states or {}).get(session_key, "")
+
+    # =========================================================================
+    # FIX 2: POST-CLICK SETTLEMENT STATE GUARD (TURN t+1 INFLATION PROTECTION)
+    # =========================================================================
+    if current_state == "APP_LAUNCH_IN_PROGRESS":
+        if is_app_foreground(current_app_package, user_prompt):
+            if session_states is not None:
+                session_states[session_key] = "COMPLETED"
+            return None  # Pass through to Pre-Plan Foreground Package Lock Guard
+
+        if len(screen_state) <= 12:
+            return ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+                user_goal=user_prompt,
+                risk_level=risk_level,
+                total_steps=1,
+                current_step_index=0,
+                is_completed=False,
+                speech_response="Waiting for application to complete launch.",
+                steps=[PlanStep(
+                    step_id=1,
+                    action=ActionType.SCROLL,
+                    target_text="rescan_wait",
+                    tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                    reason="Post-Click Settlement Protection: App launch clicked; granting 1500ms settlement window for DOM inflation.",
+                )],
+            )
+        else:
+            if session_states is not None:
+                session_states[session_key] = "APP_DRAWER_ACTIVE"
+
     if is_app_foreground(current_app_package, user_prompt):
         return None
 
@@ -112,28 +160,104 @@ def handle_app_drawer_recovery(
     is_unknown_app = app_info is not None and app_info[0] is None
     launch_failed = (status == "FAILED" and action == ActionType.OPEN_APP.value)
 
-    if launch_failed or (is_unknown_app and last_action != ActionType.SWIPE_UP.value and not looks_like_launcher_or_app_drawer(current_app_package, screen_state)):
-        return ActionPlanResponse(
-            plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
-            total_steps=1, current_step_index=0, is_completed=False,
-            speech_response="Opening App Drawer to locate application.",
-            steps=[PlanStep(step_id=1, action=ActionType.SWIPE_UP, target_node="home_screen",
-                            target_text="Open App Drawer", tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                            reason="App launch recovery: opening the App Drawer to search for application.")],
-        )
+    if current_state != "APP_DRAWER_ACTIVE":
+        if last_action == ActionType.GO_HOME.value:
+            return ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
+                total_steps=1, current_step_index=0, is_completed=False,
+                speech_response="Opening App Drawer to locate application.",
+                steps=[PlanStep(step_id=1, action=ActionType.SWIPE_UP, target_node="home_screen",
+                                target_text="Open App Drawer", tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                                reason="App launch recovery Step 2: opening the App Drawer from home screen.")],
+            )
+        needs_recovery = launch_failed or is_unknown_app
+        if needs_recovery and last_action not in {ActionType.SWIPE_UP.value, ActionType.TYPE_TEXT.value} and not looks_like_launcher_or_app_drawer(current_app_package, screen_state):
+            return ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
+                total_steps=1, current_step_index=0, is_completed=False,
+                speech_response="Navigating home to open App Drawer.",
+                steps=[PlanStep(step_id=1, action=ActionType.GO_HOME, target_node="home_screen",
+                                target_text="go_home", tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                                reason="App launch recovery Step 1: navigating to home screen before opening App Drawer.")],
+            )
 
     drawer_active = (
-        (status in {"SUCCESS", "INITIAL"} and last_action == ActionType.SWIPE_UP.value)
+        current_state == "APP_DRAWER_ACTIVE"
+        or (status in {"SUCCESS", "INITIAL"} and last_action in {ActionType.SWIPE_UP.value, ActionType.TYPE_TEXT.value})
         or looks_like_launcher_or_app_drawer(current_app_package, screen_state)
     )
     if not drawer_active:
         return None
 
+    if session_states is not None:
+        session_states[session_key] = "APP_DRAWER_ACTIVE"
+
+    app_name = app_drawer_searches.get(session_key) or extract_app_name_for_search(user_prompt)
+    app_drawer_searches[session_key] = app_name
+    candidates = normalize_app_query(app_name)
+
+    topology = classify_ui_topology(screen_state)
+    list_items = topology.get("LIST_ITEM_ZONE", [])
+
+    filtered_items = []
+    for item in list_items:
+        if not isinstance(item, dict) or not node_is_clickable(item):
+            continue
+        if is_launcher_utility_control(item):
+            continue
+        filtered_items.append(item)
+
+    # STRICT MATCH FLOOR EVALUATION (>= 65%)
+    if last_action == ActionType.TYPE_TEXT.value or len(filtered_items) > 0:
+        item_labels = [node_target_label(item) or node_text(item) for item in filtered_items]
+        best_match_label, best_score = find_best_app_match_with_score(candidates, item_labels)
+
+        # 1. High Confidence Match (>= 85%) -> Direct Click + Transition to APP_LAUNCH_IN_PROGRESS
+        if best_match_label and best_score >= 0.85:
+            target = best_match_label
+            if session_states is not None:
+                session_states[session_key] = "APP_LAUNCH_IN_PROGRESS"
+            return ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
+                total_steps=1, current_step_index=0, is_completed=False,
+                speech_response=f"Found matching app '{target}'. Launching.",
+                steps=[PlanStep(step_id=1, action=ActionType.CLICK, target_node=target, target_text=target,
+                                tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                                reason=f"App Drawer search result match: clicking {target}.")],
+            )
+        # 2. Moderate Match (65% <= score < 85%) -> Candidate Prompt
+        elif best_match_label and 0.65 <= best_score < 0.85:
+            if pending_app_confirmations is not None:
+                pending_app_confirmations[session_key] = best_match_label
+            return ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
+                total_steps=1, current_step_index=0, is_completed=False,
+                execution_state="AWAITING_USER_CONFIRMATION",
+                speech_response=f"I couldn't find '{app_name}', but I found '{best_match_label}'. Would you like me to open that?",
+                steps=[PlanStep(step_id=1, action=ActionType.FINISH,
+                                reason="Ambiguous app match: prompting user for confirmation of candidate app.")],
+            )
+        # 3. Low Match (< 65%) or Zero Items -> Play Store Auto-Install
+        elif last_action == ActionType.TYPE_TEXT.value or len(screen_state) == 0 or (len(filtered_items) > 0 and best_score < 0.65):
+            if pending_install_intents is not None:
+                pending_install_intents[session_key] = app_name
+            return ActionPlanResponse(
+                plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
+                total_steps=1, current_step_index=0, is_completed=False,
+                execution_state="AWAITING_USER_CONFIRMATION",
+                speech_response=f"The app '{app_name}' is not installed on your phone. Would you like me to install it from the Play Store?",
+                steps=[PlanStep(step_id=1, action=ActionType.FINISH,
+                                reason="App not installed (match score < 65%): prompting user for Play Store installation confirmation.")],
+            )
+
+    # APP DRAWER SEARCH BAR FOCUS & BINDING
     search_bar = next((
-        node for node in screen_state
+        node for node in (topology.get("INPUT_ZONE", []) + screen_state)
         if isinstance(node, dict) and (
             node_is_editable(node)
-            or any(token in node_text(node).lower() for token in ("search", "find", "edittext", "apps"))
+            or any(token in node_text(node).lower() for token in (
+                "search", "find", "edittext", "apps", "search_box", "search_src_text", "search_bar"
+            ))
         )
     ), None)
 
@@ -147,14 +271,12 @@ def handle_app_drawer_recovery(
                             reason="App Drawer recovery: waiting for search bar element.")],
         )
 
-    app_name = extract_app_name_for_search(user_prompt)
-    app_drawer_searches[session_key] = app_name
     target = node_target_label(search_bar) or "Search"
     return ActionPlanResponse(
         plan_id=f"plan_{uuid.uuid4().hex[:8]}", user_goal=user_prompt, risk_level=risk_level,
         total_steps=1, current_step_index=0, is_completed=False,
         speech_response=f"App Drawer active. Searching for {app_name}.",
         steps=[PlanStep(step_id=1, action=ActionType.TYPE_TEXT, target_node=target, target_text=target,
-                        input_data=app_name, tier=WaterfallTier.TIER_3_ACCESSIBILITY,
-                        reason="App Drawer recovery: typing extracted app name into search field.")],
+                        input_data=candidates["raw"], tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                        reason="App Drawer recovery: typing normalized app query into search field.")],
     )

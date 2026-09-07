@@ -26,6 +26,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.accessbridgeai.data.SessionManager
+import com.accessbridgeai.services.AccessibilityAgentService
 import com.accessbridgeai.ui.OnboardingViewModel
 import com.accessbridgeai.ui.screens.*
 import com.accessbridgeai.ui.theme.AccessbridgeAIITheme
@@ -126,6 +127,10 @@ class MainActivity : FragmentActivity() {
                                 } else {
                                     permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 }
+                            },
+                            onNewGoal = {
+                                AccessibilityAgentService.instance?.handleUserCancel()
+                                Log.d("MainActivity", "New Goal initiated: Session Reset & Hard Stop sent")
                             },
                             onLogout = {
                                 sessionManager.logout()

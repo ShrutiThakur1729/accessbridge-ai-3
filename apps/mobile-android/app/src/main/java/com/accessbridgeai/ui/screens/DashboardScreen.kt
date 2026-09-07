@@ -31,6 +31,7 @@ fun DashboardScreen(
     onEnableAccessibility: () -> Unit,
     onIgnoreBatteryOptimization: () -> Unit = {},
     onMicClick: () -> Unit,
+    onNewGoal: () -> Unit,
     onLogout: () -> Unit
 ) {
     Scaffold(
@@ -77,8 +78,13 @@ fun DashboardScreen(
                         }
                     }
                 }
-                IconButton(onClick = onLogout) {
-                    Icon(Icons.Default.Settings, contentDescription = "Settings")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = onNewGoal) {
+                        Text("New Task", style = MaterialTheme.typography.labelLarge)
+                    }
+                    IconButton(onClick = onLogout) {
+                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+                    }
                 }
             }
         }

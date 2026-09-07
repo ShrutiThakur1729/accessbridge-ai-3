@@ -155,8 +155,99 @@ class SafetyService:
         )
 
     @staticmethod
+    def classify_universal_tier(
+        user_prompt: str,
+        plan: Optional[ActionPlanResponse] = None,
+        screen_state: Optional[list] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Universal 3-Tier Safety Classifier:
+        - Tier A (Read & Navigate): Non-mutating (view, search, scroll, open app). Auto-executed.
+        - Tier B (Mutate & Direct): State modification (post, send, book, submit form). Requires confirmation.
+        - Tier C (Sensitive & Financial): Authentication, passwords, PINs, payment buttons, destructive options. Yields USER_TAKE_OVER.
+        """
+        haystack = (user_prompt or "").lower()
+        plan_blob = ""
+        if plan and plan.steps:
+            plan_blob = " ".join(
+                filter(None, [s.target_node or "" for s in plan.steps] + [s.target_text or "" for s in plan.steps] + [s.input_data or "" for s in plan.steps])
+            ).lower()
+
+        full_context = f"{haystack} {plan_blob}"
+
+        # 1. Tier C Check (Sensitive, Auth, Financial, PIN/Password)
+        sensitive_pattern = r"\b(password|pin|cvv|otp|passcode|auth|login|credential|biometric|fingerprint|card number|payment|checkout|buy now|transfer|withdraw|wipe|reset|delete account)\b"
+        if re.search(sensitive_pattern, full_context):
+            # Inspect screen_state for password/pin input types
+            return "TIER_C", "Please complete the sensitive operation on screen when ready."
+
+        if screen_state:
+            for node in screen_state:
+                if isinstance(node, dict):
+                    view_id = str(node.get("view_id") or node.get("viewId") or "").lower()
+                    text = str(node.get("text") or "").lower()
+                    class_name = str(node.get("class_name") or node.get("className") or "").lower()
+                    if "password" in view_id or "password" in class_name or "pin" in view_id or "cvv" in view_id:
+                        return "TIER_C", "Please complete the sensitive operation on screen when ready."
+
+        # 2. Tier B Check (Mutate & Direct: send, post, submit, confirm, book)
+        mutate_pattern = r"\b(send|post|submit|confirm|book|place order|delete|remove|apply|save)\b"
+        if re.search(mutate_pattern, full_context):
+            return "TIER_B", f"Action will execute '{user_prompt}'. Please confirm."
+
+        # 3. Tier A (Read & Navigate)
+        return "TIER_A", None
+
+    @staticmethod
+    def build_user_takeover_plan(
+        user_prompt: str,
+        explanation: str = "Please complete the sensitive operation on screen when ready.",
+        existing: Optional[ActionPlanResponse] = None,
+    ) -> ActionPlanResponse:
+        logger.warning(
+            "Safety USER_TAKE_OVER issued prompt_preview=%s",
+            user_prompt[:80],
+        )
+        return ActionPlanResponse(
+            plan_id=existing.plan_id if existing else "plan_user_takeover",
+            user_goal=user_prompt,
+            risk_level=RiskLevel.RED,
+            total_steps=1,
+            current_step_index=0,
+            is_completed=True,
+            speech_response=explanation,
+            execution_state="USER_TAKE_OVER",
+            approach="SAFETY_INTERCEPT",
+            steps=[
+                PlanStep(
+                    step_id=1,
+                    action=ActionType.USER_TAKE_OVER,
+                    target_node=None,
+                    target_text="USER_TAKE_OVER",
+                    input_data=None,
+                    tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                    requires_biometric=True,
+                    reason=explanation,
+                    execution_mode="ACCESSIBILITY",
+                )
+            ],
+        )
+
+    @staticmethod
     def intercept_plan(plan: ActionPlanResponse, user_prompt: str) -> Tuple[ActionPlanResponse, bool]:
         """Mandatory checkpoint between planner output and Gateway dispatch."""
+        tier, explanation = SafetyService.classify_universal_tier(user_prompt, plan)
+
+        if tier == "TIER_C":
+            return SafetyService.build_user_takeover_plan(user_prompt, explanation or "Sensitive operation detected.", plan), True
+
+        if tier == "TIER_B":
+            updated_plan = plan.model_copy(update={
+                "requires_confirmation": True,
+                "execution_state": "AWAITING_USER_CONFIRMATION",
+            })
+            return updated_plan, False
+
         reason = SafetyService.classify_red_reason(user_prompt, plan)
         has_destructive_step = any(SafetyService._step_is_destructive(step) for step in plan.steps)
 

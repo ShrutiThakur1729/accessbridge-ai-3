@@ -11,6 +11,7 @@ export interface ResponsePayload {
   session_id: string;
   language_code: string;
   execution_state: string;
+  requires_confirmation?: boolean;
   approach: string;
   speech_response: string;
   action_type: PlannerActionType;
@@ -230,6 +231,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           task_id: taskId || "",
+          session_id: "",
           speech_response: error.message,
           action_type: "FINISH",
           target_text: "",
@@ -340,11 +342,13 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             : "USER_INTENT";
         
         const providedTranscript = String(parsedMessage.transcript || parsedMessage.user_prompt || parsedMessage.original_intent || "").trim();
+        
+        // Context lookup now uses sessionId to ensure continuous memory across per-turn taskIds
         const storedContext = sessionContexts.get(sessionId);
         const transcript = providedTranscript || storedContext?.transcript || "";
 
         if (!transcript && messageType === "USER_INTENT") {
-          logger.warn({ taskId, requestId }, "Received USER_INTENT with empty transcript. Aborting call to AI Planner.");
+          logger.warn({ taskId, sessionId, requestId }, "Received USER_INTENT with empty transcript. Aborting call to AI Planner.");
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               task_id: taskId,
@@ -416,7 +420,6 @@ export function setupWebSocketServer(wss: WebSocketServer) {
         const originalElementsCount = Array.isArray(screenState) ? screenState.length : 0;
         const executedAction = parsedMessage.target_action || parsedMessage.action_type || parsedMessage.action;
 
-        // Populate complete Action History details for target blacklisting in planner_service.py
         if (executedAction && actionStatus.toUpperCase() !== "INITIAL") {
           taskContext.actionHistory.push({
             action_type: String(executedAction),
@@ -450,6 +453,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           );
         }
 
+        // Store back in sessionContexts keyed by persistent sessionId
         sessionContexts.set(sessionId, taskContext);
 
         const compressedScreenState = compressScreenState(screenState);
@@ -627,6 +631,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           session_id: sessionId,
           language_code: normalizeLanguage(aiPlan.session_language, sessionLanguage),
           execution_state: isHardStop ? "ERROR" : aiPlan.execution_state || "EXECUTING",
+          requires_confirmation: aiPlan.requires_confirmation,
           approach: isHardStop ? "SAFETY_INTERCEPT" : aiPlan.approach || "SERVER_REPLANNING",
           speech_response: prematureCompletion
             ? "Target application could not be launched."
@@ -651,8 +656,10 @@ export function setupWebSocketServer(wss: WebSocketServer) {
 
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(responsePayload));
-          logger.info({ requestId, taskId, responsePayload }, "Sent AI planner directive to Android");
-          if (responsePayload.is_completed) {
+          logger.info({ requestId, taskId, sessionId, responsePayload }, "Sent AI planner directive to Android");
+          
+          // Step 1: Session context is cleared ONLY when task is marked fully completed AND execution_state is COMPLETED
+          if (responsePayload.is_completed === true && responsePayload.execution_state === "COMPLETED") {
             sessionContexts.delete(sessionId);
           }
         }

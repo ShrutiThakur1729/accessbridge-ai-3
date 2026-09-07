@@ -1,4 +1,5 @@
 from typing import Any, Dict, List, Optional
+from app.services.planner.ui_topology import group_spatial_nodes
 
 
 def _value(node: Dict[str, Any], *keys: str) -> str:
@@ -38,9 +39,10 @@ def _clean_node_entry(node: Dict[str, Any], role: str) -> Dict[str, Any]:
 
 def compress_screen_state(screen_state: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Cleans and categorizes raw Android accessibility tree nodes into two structural arrays:
+    Cleans and categorizes raw Android accessibility tree nodes into structural arrays:
     - interactive_targets: Clickable items, buttons, actionable titles, input/search fields.
     - secondary_metadata: Subtitles, message preview snippets, timestamps, status text.
+    - grouped_objects: Spatially unified visual cards/objects for higher-level perception.
     """
     interactive_targets: List[Dict[str, Any]] = []
     secondary_metadata: List[Dict[str, Any]] = []
@@ -53,7 +55,10 @@ def compress_screen_state(screen_state: List[Dict[str, Any]]) -> Dict[str, Any]:
             "focused_hint": None,
             "interactive_targets": [],
             "secondary_metadata": [],
+            "grouped_objects": [],
         }
+
+    grouped_objects = group_spatial_nodes(screen_state)
 
     for raw_node in screen_state:
         if not isinstance(raw_node, dict):
@@ -102,4 +107,6 @@ def compress_screen_state(screen_state: List[Dict[str, Any]]) -> Dict[str, Any]:
         "focused_hint": focused_hint,
         "interactive_targets": interactive_targets,
         "secondary_metadata": secondary_metadata,
+        "grouped_objects": grouped_objects,
     }
+

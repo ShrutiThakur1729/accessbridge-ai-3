@@ -81,6 +81,8 @@ object LoopDetector {
         }
 
         val currentKey = "${packageName}_${domHash}_${actionType}_${targetText}"
+        
+        // Exact same layout structure and actionable intent check
         if (loopBuffer.size >= 6) {
             loopBuffer.removeFirst()
         }

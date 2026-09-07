@@ -36,6 +36,8 @@ class VoiceAssistantManager(
     @Volatile
     private var isRecording = false
 
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     init {
         // Initialize TTS
         textToSpeech = TextToSpeech(context, this)
@@ -147,9 +149,10 @@ class VoiceAssistantManager(
 
     // --- Phase 3: BACKGROUND AUDIO PLAYBACK (TTS) ---
 
-    fun playAudioResponse(base64Audio: String) {
+    fun playAudioResponse(base64Audio: String, onFinished: (() -> Unit)? = null) {
         if (base64Audio.isBlank()) {
             Log.w("VoiceManager", "playAudioResponse: Received empty or blank audio data.")
+            onFinished?.invoke()
             return
         }
         try {
@@ -197,22 +200,28 @@ class VoiceAssistantManager(
                     it.release()
                     mediaPlayer = null
                     if (tempFile.exists()) tempFile.delete()
-                    onSpeechStateChanged("IDLE")
                     
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                        audioFocusRequest?.let { req ->
-                            audioManager.abandonAudioFocusRequest(req as android.media.AudioFocusRequest)
+                    mainHandler.post {
+                        onSpeechStateChanged("IDLE")
+                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                            audioFocusRequest?.let { req ->
+                                audioManager.abandonAudioFocusRequest(req as android.media.AudioFocusRequest)
+                            }
+                            audioFocusRequest = null
+                        } else {
+                            @Suppress("DEPRECATION")
+                            audioManager.abandonAudioFocus(null)
                         }
-                        audioFocusRequest = null
-                    } else {
-                        @Suppress("DEPRECATION")
-                        audioManager.abandonAudioFocus(null)
+                        onFinished?.invoke()
                     }
                 }
                 setOnErrorListener { mp, what, extra ->
                     Log.e("VoiceManager", "MediaPlayer error: $what, $extra")
-                    onSpeechStateChanged("IDLE")
                     if (tempFile.exists()) tempFile.delete()
+                    mainHandler.post {
+                        onSpeechStateChanged("IDLE")
+                        onFinished?.invoke()
+                    }
                     false
                 }
                 prepareAsync()
@@ -220,6 +229,7 @@ class VoiceAssistantManager(
         } catch (e: Exception) {
             Log.e("VoiceManager", "Error playing audio response", e)
             onSpeechStateChanged("IDLE")
+            onFinished?.invoke()
         }
     }
 
@@ -237,24 +247,38 @@ class VoiceAssistantManager(
         }
     }
 
-    fun speak(text: String) {
+    fun speak(text: String, onFinished: (() -> Unit)? = null) {
         if (!isTtsInitialized || text.isBlank()) {
             Log.d("VoiceManager", "speak: Skipping empty or blank text.")
+            onFinished?.invoke()
             return
         }
-        onSpeechStateChanged("SPEAKING")
-        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "AccessBridgeTTS")
+        try {
+            onSpeechStateChanged("SPEAKING")
+            textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "AccessBridgeTTS")
 
-        // Listen for when speech finishes to reset state
-        textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
-            override fun onDone(utteranceId: String?) {
-                onSpeechStateChanged("IDLE")
-            }
-            override fun onError(utteranceId: String?) {
-                onSpeechStateChanged("IDLE")
-            }
-        })
+            // Listen for when speech finishes to reset state
+            textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) {
+                    mainHandler.post {
+                        onSpeechStateChanged("IDLE")
+                        onFinished?.invoke()
+                    }
+                }
+
+                override fun onError(utteranceId: String?) {
+                    mainHandler.post {
+                        onSpeechStateChanged("IDLE")
+                        onFinished?.invoke()
+                    }
+                }
+            })
+        } catch (e: Exception) {
+            Log.e("VoiceManager", "TTS Speak failed", e)
+            onSpeechStateChanged("IDLE")
+            onFinished?.invoke()
+        }
     }
 
     // --- 2. SPEECH-TO-TEXT (STT) LOGIC (LEGACY/PHASE 1) ---
@@ -302,15 +326,17 @@ class VoiceAssistantManager(
             }
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val spokenText = matches?.getOrNull(0)
-                Log.d("VoiceManager", "onResults: $spokenText")
-                if (!spokenText.isNullOrBlank()) {
-                    onSpeechRecognized(spokenText)
+                val finalSpeech = matches?.getOrNull(0)?.trim() ?: ""
+                
+                if (finalSpeech.isEmpty()) {
+                    Log.w("AccessibilityAgent", "Suppressed USER_INTENT dispatch: Empty transcript.")
                     onSpeechStateChanged("IDLE")
-                } else {
-                    Log.d("VoiceManager", "onResults: Ignoring empty or blank transcript.")
-                    onSpeechStateChanged("IDLE")
+                    return
                 }
+                
+                Log.d("VoiceManager", "onResults: $finalSpeech")
+                onSpeechRecognized(finalSpeech)
+                onSpeechStateChanged("IDLE")
             }
             override fun onPartialResults(partialResults: Bundle?) {
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)

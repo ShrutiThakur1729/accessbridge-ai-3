@@ -170,6 +170,7 @@ function setupWebSocketServer(wss) {
             if (ws.readyState === ws_1.WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                     task_id: taskId || "",
+                    session_id: "",
                     speech_response: error.message,
                     action_type: "FINISH",
                     target_text: "",
@@ -270,10 +271,11 @@ function setupWebSocketServer(wss) {
                     ? "USER_INTENT_FEEDBACK"
                     : "USER_INTENT";
                 const providedTranscript = String(parsedMessage.transcript || parsedMessage.user_prompt || parsedMessage.original_intent || "").trim();
+                // Context lookup now uses sessionId to ensure continuous memory across per-turn taskIds
                 const storedContext = sessionContexts.get(sessionId);
                 const transcript = providedTranscript || storedContext?.transcript || "";
                 if (!transcript && messageType === "USER_INTENT") {
-                    logger_js_1.logger.warn({ taskId, requestId }, "Received USER_INTENT with empty transcript. Aborting call to AI Planner.");
+                    logger_js_1.logger.warn({ taskId, sessionId, requestId }, "Received USER_INTENT with empty transcript. Aborting call to AI Planner.");
                     if (ws.readyState === ws_1.WebSocket.OPEN) {
                         ws.send(JSON.stringify({
                             task_id: taskId,
@@ -334,7 +336,6 @@ function setupWebSocketServer(wss) {
                     "").trim();
                 const originalElementsCount = Array.isArray(screenState) ? screenState.length : 0;
                 const executedAction = parsedMessage.target_action || parsedMessage.action_type || parsedMessage.action;
-                // Populate complete Action History details for target blacklisting in planner_service.py
                 if (executedAction && actionStatus.toUpperCase() !== "INITIAL") {
                     taskContext.actionHistory.push({
                         action_type: String(executedAction),
@@ -362,6 +363,7 @@ function setupWebSocketServer(wss) {
                     }
                     logger_js_1.logger.warn({ requestId, taskId, sessionId, targetActionStr, isPassiveDelay, blacklistMemory: taskContext.blacklistMemory }, "LOOP_DETECTED feedback received: processed session blacklist memory");
                 }
+                // Store back in sessionContexts keyed by persistent sessionId
                 sessionContexts.set(sessionId, taskContext);
                 const compressedScreenState = compressScreenState(screenState);
                 const screenshotBase64 = screenshotFrom(parsedMessage);
@@ -507,6 +509,7 @@ function setupWebSocketServer(wss) {
                     session_id: sessionId,
                     language_code: normalizeLanguage(aiPlan.session_language, sessionLanguage),
                     execution_state: isHardStop ? "ERROR" : aiPlan.execution_state || "EXECUTING",
+                    requires_confirmation: aiPlan.requires_confirmation,
                     approach: isHardStop ? "SAFETY_INTERCEPT" : aiPlan.approach || "SERVER_REPLANNING",
                     speech_response: prematureCompletion
                         ? "Target application could not be launched."
@@ -528,8 +531,9 @@ function setupWebSocketServer(wss) {
                 };
                 if (ws.readyState === ws_1.WebSocket.OPEN) {
                     ws.send(JSON.stringify(responsePayload));
-                    logger_js_1.logger.info({ requestId, taskId, responsePayload }, "Sent AI planner directive to Android");
-                    if (responsePayload.is_completed) {
+                    logger_js_1.logger.info({ requestId, taskId, sessionId, responsePayload }, "Sent AI planner directive to Android");
+                    // Step 1: Session context is cleared ONLY when task is marked fully completed AND execution_state is COMPLETED
+                    if (responsePayload.is_completed === true && responsePayload.execution_state === "COMPLETED") {
                         sessionContexts.delete(sessionId);
                     }
                 }

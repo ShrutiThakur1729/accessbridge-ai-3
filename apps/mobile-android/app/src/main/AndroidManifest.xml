@@ -45,7 +45,7 @@
         <!-- TEMPORARILY COMMENTED OUT UNTIL PHASE 5 -->
 
         <service
-            android:name=".AccessibilityAgentService"
+            android:name=".services.AccessibilityAgentService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true">
             <intent-filter>

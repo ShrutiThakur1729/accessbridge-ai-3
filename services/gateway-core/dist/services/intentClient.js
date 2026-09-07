@@ -72,7 +72,7 @@ class VisionClient {
             return data;
         }
         catch (error) {
-            logger_js_1.logger.warn({ requestId, error: error?.message || String(error) }, "Service 04 unreachable");
+            logger_js_1.logger.warn({ requestId, error: error?.maessage || String(error) }, "Service 04 unreachable");
             return null;
         }
     }
