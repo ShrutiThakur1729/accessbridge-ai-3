@@ -10,12 +10,19 @@ from app.utils.screen_compressor import compress_screen_state
 
 from app.services.planner.utils import sanitize_text
 from app.services.planner.ui_topology import (
-    classify_ui_topology, detect_context_mode, node_target_label, node_text, node_is_editable, node_is_clickable
-    classify_ui_topology, detect_context_mode, node_target_label, node_text, node_is_editable, node_is_clickable,
+    classify_ui_topology,
+    detect_context_mode,
+    node_target_label,
+    node_text,
+    node_is_editable,
+    node_is_clickable,
     find_best_app_match
 )
-from app.services.planner.entity_extractor import extract_clean_entity, extract_intent_payloads
-from app.services.planner.entity_extractor import extract_clean_entity, extract_intent_payloads, normalize_app_query
+from app.services.planner.entity_extractor import (
+    extract_clean_entity,
+    extract_intent_payloads,
+    normalize_app_query,
+)
 from app.services.planner.state_guards import (
     dismiss_overlay_if_present, handle_post_contact_selection, prioritize_unadjusted_parameter_control
 )

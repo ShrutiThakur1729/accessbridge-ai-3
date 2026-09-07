@@ -10,4 +10,14 @@ export const ENV = {
   STT_MODEL: process.env.STT_MODEL || "whisper-1",
   MIN_AUDIO_BYTES: process.env.MIN_AUDIO_BYTES ? parseInt(process.env.MIN_AUDIO_BYTES, 10) : 256,
   MAX_AUDIO_BYTES: process.env.MAX_AUDIO_BYTES ? parseInt(process.env.MAX_AUDIO_BYTES, 10) : 25 * 1024 * 1024,
+
+  // Databricks SQL Statement API
+  DATABRICKS_HOST: process.env.DATABRICKS_HOST || "",
+  DATABRICKS_TOKEN: process.env.DATABRICKS_TOKEN || "",
+  DATABRICKS_HTTP_PATH: process.env.DATABRICKS_HTTP_PATH || "",
+
+  // Telemetry WebSocket (separate from main WS on PORT)
+  TELEMETRY_WS_PORT: process.env.TELEMETRY_WS_PORT
+    ? parseInt(process.env.TELEMETRY_WS_PORT, 10)
+    : 3001,
 };

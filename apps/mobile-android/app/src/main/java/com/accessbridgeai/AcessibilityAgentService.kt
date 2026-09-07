@@ -18,12 +18,18 @@ import android.graphics.Rect
 import android.util.Base64
 import android.util.Log
 import android.widget.Toast
+import com.accessbridgeai.data.TelemetryLog
+import com.google.gson.Gson
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.*
 import java.io.ByteArrayOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import kotlin.coroutines.resume
 
 class AccessibilityAgentService : AccessibilityService() {
@@ -117,11 +123,12 @@ class AccessibilityAgentService : AccessibilityService() {
 
     private fun initializeComponents() {
         webSocketManager = WebSocketManager(
-            serverUrl = "ws://192.168.29.217:3000",
+            serverUrl = "ws://10.241.151.184:3000",
+            telemetryUrl = "ws://10.241.151.184:3001",
             onMessageReceived = { json -> handleBackendDirective(json) },
             onConnectionStatusChanged = { connected ->
                 val wasConnected = _connectionStatus.value
-                Log.d("AccessibilityAgent", "WebSocket connected: $connected")
+                Log.d("AccessibilityAgent", "Main WebSocket connected: $connected")
                 _connectionStatus.value = connected
                 if (wasConnected && !connected) {
                     voiceAssistantManager?.stopAudioStreaming()
@@ -193,6 +200,12 @@ class AccessibilityAgentService : AccessibilityService() {
         }
     }
 
+    private fun getIsoTimestamp(): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+        sdf.timeZone = TimeZone.getTimeZone("UTC")
+        return sdf.format(Date())
+    }
+
     /**
      * LOCAL DEBUG: Prints the JSON payload matching the WebSocket format directly to Logcat.
      * Allows local verification of DOM extraction and metadata enrichment.
@@ -253,6 +266,16 @@ class AccessibilityAgentService : AccessibilityService() {
                 else -> "Server error: $error"
             }
 
+            // Objective 5: Telemetry - Failure Detected
+            val telemetry = TelemetryLog(
+                sessionId = currentTaskId ?: "unknown",
+                targetAppPackage = "N/A",
+                failedAction = "BACKEND_DIRECTIVE",
+                failureReason = notice,
+                timestamp = getIsoTimestamp()
+            )
+            webSocketManager?.sendMessage(Gson().toJson(telemetry))
+
             Log.e("AccessibilityAgent", "Backend failure intercepted: $notice")
             
             executionAttempts.clear()
@@ -299,7 +322,7 @@ class AccessibilityAgentService : AccessibilityService() {
 
                 Log.d("AccessibilityAgent", "Processing directive: $actionType, task_id: $currentTaskId")
 
-                // Local Loop Detection
+                // Local Loop Detection Logic Update
                 if (actionType == "CLICK" || actionType == "TYPE_TEXT") {
                     val currentScreenState = captureScreenStateWithRetry()
                     val elements = currentScreenState.optJSONArray("screenElements") ?: JSONArray()
@@ -307,6 +330,18 @@ class AccessibilityAgentService : AccessibilityService() {
                     
                     if (LoopDetector.isLoopDetected(packageName ?: "", domHash, actionType, targetText ?: "", elements.length())) {
                         Log.e("AccessibilityAgent", "LOOP DETECTED: Action $actionType on $targetText with same DOM state (3x sequential).")
+                        
+                        // Objective 5: Telemetry - Loop Detected
+                        val telemetry = TelemetryLog(
+                            sessionId = currentTaskId ?: "unknown",
+                            targetAppPackage = packageName ?: "unknown",
+                            failedAction = actionType,
+                            targetLabel = targetText,
+                            failureReason = "LOOP_DETECTED",
+                            timestamp = getIsoTimestamp()
+                        )
+                        webSocketManager?.sendMessage(Gson().toJson(telemetry))
+
                         val loopPayload = JSONObject().apply {
                             put("type", "USER_INTENT_FEEDBACK")
                             put("task_id", currentTaskId ?: "")
@@ -508,10 +543,10 @@ class AccessibilityAgentService : AccessibilityService() {
 
         // Iterate through all windows to find the target text
         for (window in windows) {
-            val rootNode = window.root ?: continue
+            val root = window.root ?: continue
             
             // 1. Fast path: Use built-in search
-            val nodes = rootNode.findAccessibilityNodeInfosByText(text)
+            val nodes = root.findAccessibilityNodeInfosByText(text)
             for (node in nodes) {
                 if (!node.isVisibleToUser) {
                     if (bestError == null || getStatusPriority(bestError.status) < getStatusPriority("OFF_SCREEN")) {
@@ -523,7 +558,7 @@ class AccessibilityAgentService : AccessibilityService() {
                 if (result.success) {
                     val context = getNodeContext(node)
                     nodes.forEach { it.recycle() }
-                    rootNode.recycle()
+                    root.recycle()
                     return result.copy(nodeContext = context)
                 }
                 if (bestError == null || getStatusPriority(result.status) > getStatusPriority(bestError.status)) {
@@ -533,8 +568,8 @@ class AccessibilityAgentService : AccessibilityService() {
             nodes.forEach { it.recycle() }
             
             // 2. Fallback: Deep recursive search within this window
-            val recursiveResult = recursiveClickSearchRich(rootNode, target)
-            rootNode.recycle()
+            val recursiveResult = recursiveClickSearchRich(root, target)
+            root.recycle()
             
             if (recursiveResult.success) {
                 Log.d("AccessibilityAgent", "Recursive click search succeeded in window: ${window.title} for: '$text'")
@@ -1213,6 +1248,19 @@ class AccessibilityAgentService : AccessibilityService() {
                 finalStatus = "EMPTY_UI_STATE"
                 finalErrorMessage = "Action appeared successful but no UI elements were captured after settlement."
                 Log.w("AccessibilityAgent", finalErrorMessage)
+            }
+
+            // Objective 5: Telemetry - Failure Detected during UI Action
+            if (!finalSuccess) {
+                val telemetry = TelemetryLog(
+                    sessionId = capturedTaskId ?: "unknown",
+                    targetAppPackage = targetPackage?.ifBlank { null } ?: activePackageInCapture?.ifBlank { null } ?: "N/A",
+                    failedAction = actionType,
+                    targetLabel = targetNode,
+                    failureReason = finalErrorMessage ?: finalStatus,
+                    timestamp = getIsoTimestamp()
+                )
+                webSocketManager?.sendMessage(Gson().toJson(telemetry))
             }
 
             val payload = JSONObject().apply {

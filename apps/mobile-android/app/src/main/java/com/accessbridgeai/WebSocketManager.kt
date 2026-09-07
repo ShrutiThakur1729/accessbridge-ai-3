@@ -6,30 +6,40 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 class WebSocketManager(
-    private val serverUrl: String, // e.g., "ws://10.0.2.2:3000" for Android Emulator targeting local backend
+    private val serverUrl: String,    // e.g., "ws://10.0.2.2:3000"
+    private val telemetryUrl: String, // e.g., "ws://10.0.2.2:3001"
     private val onMessageReceived: (JSONObject) -> Unit,
     private val onConnectionStatusChanged: (Boolean) -> Unit
 ) {
 
     private val client = OkHttpClient.Builder()
-        .readTimeout(0, TimeUnit.MILLISECONDS) // Keep socket alive indefinitely
-        .pingInterval(60, TimeUnit.SECONDS)   // Send keep-alive pings
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(60, TimeUnit.SECONDS)
         .build()
 
-    private var webSocket: WebSocket? = null
-    private var isConnected = false
+    private var mainWebSocket: WebSocket? = null
+    private var telemetryWebSocket: WebSocket? = null
+    
+    private var isMainConnected = false
+    private var isTelemetryConnected = false
+    
     private var shouldReconnect = true
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
     private var reconnectAttempt = 0
 
     fun connect() {
         shouldReconnect = true
+        connectMain()
+        connectTelemetry()
+    }
+
+    private fun connectMain() {
         val request = Request.Builder().url(serverUrl).build()
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+        mainWebSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                isConnected = true
+                isMainConnected = true
                 reconnectAttempt = 0
-                Log.d("WebSocketManager", "Connected to Gateway-Core successfully!")
+                Log.d("WebSocketManager", "Main socket connected to $serverUrl")
                 onConnectionStatusChanged(true)
             }
 
@@ -38,74 +48,109 @@ class WebSocketManager(
                     val jsonResponse = JSONObject(text)
                     onMessageReceived(jsonResponse)
                 } catch (e: Exception) {
-                    Log.e("WebSocketManager", "Failed to parse incoming JSON payload: $text", e)
+                    Log.e("WebSocketManager", "Failed to parse main socket JSON: $text", e)
                 }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                isConnected = false
-                Log.d("WebSocketManager", "Connection closed: $reason")
-                onConnectionStatusChanged(false)
-                if (shouldReconnect) {
-                    scheduleReconnect()
-                }
+                isMainConnected = false
+                Log.d("WebSocketManager", "Main socket closed: $reason")
+                checkOverallStatus()
+                if (shouldReconnect) scheduleReconnect()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                isConnected = false
-                Log.e("WebSocketManager", "WebSocket failure: ${t.message}")
-                onConnectionStatusChanged(false)
-                if (shouldReconnect) {
-                    scheduleReconnect()
-                }
+                isMainConnected = false
+                Log.e("WebSocketManager", "Main socket failure: ${t.message}")
+                checkOverallStatus()
+                if (shouldReconnect) scheduleReconnect()
             }
         })
     }
 
-    private fun scheduleReconnect() {
-        val delay = (Math.min(Math.pow(2.0, reconnectAttempt.toDouble()).toLong(), 30L)) * 1000L
-        Log.d("WebSocketManager", "Scheduling reconnect in $delay ms (attempt $reconnectAttempt)")
-        handler.postDelayed({
-            if (shouldReconnect && !isConnected) {
-                reconnectAttempt++
-                connect()
+    private fun connectTelemetry() {
+        val request = Request.Builder().url(telemetryUrl).build()
+        telemetryWebSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                isTelemetryConnected = true
+                Log.d("WebSocketManager", "Telemetry socket connected to $telemetryUrl")
             }
-        }, delay)
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                isTelemetryConnected = false
+                Log.d("WebSocketManager", "Telemetry socket closed: $reason")
+                if (shouldReconnect) scheduleReconnect()
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                isTelemetryConnected = false
+                Log.e("WebSocketManager", "Telemetry socket failure: ${t.message}")
+                if (shouldReconnect) scheduleReconnect()
+            }
+        })
     }
 
-    // Send payload (e.g., user speech transcript or screen context) upstream to Service 01
-    fun sendPayload(payload: JSONObject): Boolean {
-        // GUARD: If not connected, don't even try OkHttp. 
-        // This prevents the 40ms flood of socket errors.
-        if (webSocket == null || !isConnected) {
-            return false 
-        }
+    private fun checkOverallStatus() {
+        onConnectionStatusChanged(isMainConnected)
+    }
 
-        // Pre-send guard: Do not send USER_INTENT if transcript or user_prompt is empty
+    private fun scheduleReconnect() {
+        handler.removeCallbacksAndMessages("reconnect")
+        val delay = (Math.min(Math.pow(2.0, reconnectAttempt.toDouble()).toLong(), 30L)) * 1000L
+        handler.postAtTime({
+            if (shouldReconnect) {
+                reconnectAttempt++
+                if (!isMainConnected) connectMain()
+                if (!isTelemetryConnected) connectTelemetry()
+            }
+        }, "reconnect", android.os.SystemClock.uptimeMillis() + delay)
+    }
+
+    fun sendPayload(payload: JSONObject): Boolean {
+        if (mainWebSocket == null || !isMainConnected) return false
+
         if (payload.optString("type") == "USER_INTENT") {
             val transcript = payload.optString("transcript")
             val userPrompt = payload.optString("user_prompt")
-            if (transcript.isBlank() || userPrompt.isBlank()) {
-                Log.w("WebSocketManager", "Aborting send: USER_INTENT has empty/blank transcript or user_prompt.")
-                return false
-            }
+            if (transcript.isBlank() || userPrompt.isBlank()) return false
         }
 
         return try {
-            webSocket?.send(payload.toString()) ?: false
+            mainWebSocket?.send(payload.toString()) ?: false
         } catch (e: Exception) {
-            Log.e("WebSocketManager", "Send error: ${e.message}")
-            isConnected = false
+            Log.e("WebSocketManager", "Main send error: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Routes telemetry data strictly through port 3001 (telemetryUrl).
+     */
+    fun sendMessage(text: String): Boolean {
+        if (telemetryWebSocket == null || !isTelemetryConnected) {
+            Log.w("WebSocketManager", "Telemetry socket not connected. Dropping message.")
+            return false
+        }
+        return try {
+            telemetryWebSocket?.send(text) ?: false
+        } catch (e: Exception) {
+            Log.e("WebSocketManager", "Telemetry send error: ${e.message}")
             false
         }
     }
 
     fun disconnect() {
         shouldReconnect = false
-        webSocket?.close(1000, "Client shutting down")
-        webSocket = null
-        isConnected = false
-        onConnectionStatusChanged(false)
         handler.removeCallbacksAndMessages(null)
+        
+        mainWebSocket?.close(1000, "Client shutdown")
+        mainWebSocket = null
+        isMainConnected = false
+        
+        telemetryWebSocket?.close(1000, "Client shutdown")
+        telemetryWebSocket = null
+        isTelemetryConnected = false
+        
+        onConnectionStatusChanged(false)
     }
 }
