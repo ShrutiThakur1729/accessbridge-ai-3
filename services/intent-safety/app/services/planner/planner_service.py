@@ -10,7 +10,6 @@ from app.utils.screen_compressor import compress_screen_state
 
 from app.services.planner.utils import sanitize_text
 from app.services.planner.ui_topology import (
-    classify_ui_topology, detect_context_mode, node_target_label, node_text, node_is_editable, node_is_clickable
     classify_ui_topology, detect_context_mode, node_target_label, node_text, node_is_editable, node_is_clickable,
     find_best_app_match
 )
