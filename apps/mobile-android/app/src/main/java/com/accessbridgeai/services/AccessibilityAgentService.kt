@@ -1,9 +1,9 @@
 package com.accessbridgeai.services
 
+import android.accessibilityservice.AccessibilityButtonController
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.Context
-import android.content.Intent
+import android.content.pm.LauncherApps
 import android.graphics.Path
 import android.graphics.Point
 import android.graphics.Rect
@@ -13,7 +13,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Toast
-import com.accessbridgeai.ExecutionEngine
+import com.accessbridgeai.utils.ExecutionEngine
 import com.accessbridgeai.MainActivity
 import com.accessbridgeai.WebSocketManager
 import com.accessbridgeai.VoiceAssistantManager
@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 class AccessibilityAgentService : AccessibilityService() {
 
@@ -39,6 +40,10 @@ class AccessibilityAgentService : AccessibilityService() {
     var webSocketManager: WebSocketManager? = null
     var voiceAssistantManager: VoiceAssistantManager? = null
     private lateinit var sessionManager: SessionManager
+
+    private var currentSessionId: String? = null
+    private var sessionResetJob: Job? = null
+    private val sessionInactivityTimeout = 5 * 60 * 1000L // 5 minutes
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var activeDirectiveJob: Job? = null
@@ -59,7 +64,7 @@ class AccessibilityAgentService : AccessibilityService() {
     data class ActionResult(
         val success: Boolean,
         val status: String,
-        val failure_reason: String? = null,
+        val failureReason: String? = null,
         val nodeContext: JSONObject? = null,
         val packageLaunched: String? = null,
         val candidates: List<String>? = null
@@ -72,6 +77,11 @@ class AccessibilityAgentService : AccessibilityService() {
         Log.d("AccessibilityAgent", "Service Connected")
 
         sessionManager = SessionManager(this)
+
+        // Native Accessibility Button Callback Integration (API 26+)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            setupAccessibilityButton()
+        }
 
         webSocketManager = WebSocketManager(
             serverUrl = "ws://192.168.29.217:3000/ws/agent", // Placeholder, should be configurable
@@ -99,14 +109,44 @@ class AccessibilityAgentService : AccessibilityService() {
         )
     }
 
+    @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.O)
+    private fun setupAccessibilityButton() {
+        val callback = object : AccessibilityButtonController.AccessibilityButtonCallback() {
+            override fun onClicked(controller: AccessibilityButtonController?) {
+                Log.d("AccessibilityAgent", "Native accessibility button clicked.")
+                startAssistant()
+            }
+
+            override fun onAvailabilityChanged(controller: AccessibilityButtonController?, available: Boolean) {
+                Log.d("AccessibilityAgent", "Accessibility button availability changed: $available")
+            }
+        }
+        accessibilityButtonController.registerAccessibilityButtonCallback(callback)
+    }
+
     fun startAssistant() {
+        refreshSession()
         voiceAssistantManager?.startListening()
     }
 
+    private fun refreshSession() {
+        if (currentSessionId == null) {
+            currentSessionId = UUID.randomUUID().toString()
+            Log.d("AccessibilityAgent", "Generated new global session ID: $currentSessionId")
+        }
+        resetSessionTimer()
+    }
+
+    private fun resetSessionTimer() {
+        sessionResetJob?.cancel()
+        sessionResetJob = serviceScope.launch {
+            delay(sessionInactivityTimeout)
+            Log.d("AccessibilityAgent", "Global session expired due to inactivity.")
+            currentSessionId = null
+        }
+    }
+
     fun handleUserCancel() {
-        voiceAssistantManager?.stopAllOperations()
-        activeDirectiveJob?.cancel()
-        
         val currentSessionId = sessionManager.getSessionId()
         val payload = JSONObject().apply {
             put("type", "HARD_STOP")
@@ -114,11 +154,23 @@ class AccessibilityAgentService : AccessibilityService() {
             put("timestamp", System.currentTimeMillis())
         }
         sendPayload(payload)
+        performTakeOverCleanup()
+    }
 
+    /**
+     * Resets the agent state, stops all active voice/tasks, and rotates the session ID.
+     * Called on HARD_STOP, USER_TAKE_OVER, or manual cancellation.
+     */
+    fun performTakeOverCleanup() {
+        Log.d("AccessibilityAgent", "Performing Takeover/Cleanup: Resetting session.")
+        voiceAssistantManager?.stopAllOperations()
+        activeDirectiveJob?.cancel()
         currentTaskId = null
         currentOriginalIntent = null
         executionAttempts.clear()
         LoopDetector.clearHistory()
+        currentSessionId = null
+        sessionResetJob?.cancel()
         sessionManager.resetSession()
     }
 
@@ -136,9 +188,10 @@ class AccessibilityAgentService : AccessibilityService() {
 
     fun sendPayload(payload: JSONObject, purgeQueue: Boolean = false): Boolean {
         return try {
+            refreshSession() // Ensure session is active and timer is reset
+            
             if (!payload.has("session_id")) {
-                val sessionId = sessionManager.getSessionId()
-                payload.put("session_id", sessionId)
+                payload.put("session_id", currentSessionId)
             }
             
             // Enrich with task_id if not present but available
@@ -203,7 +256,7 @@ class AccessibilityAgentService : AccessibilityService() {
             when (gatingResult) {
                 is LauncherAppResolver.LaunchGatingResult.SIMPLE_LAUNCH -> {
                     voiceAssistantManager?.speak("Opening ${gatingResult.appLabel}")
-                    val launcherApps = getSystemService(Context.LAUNCHER_APPS_SERVICE) as android.content.pm.LauncherApps
+                    val launcherApps = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
                     try {
                         launcherApps.startMainActivity(gatingResult.componentName, gatingResult.userHandle, null, null)
                         
@@ -274,9 +327,15 @@ class AccessibilityAgentService : AccessibilityService() {
                     else -> "Server error: $error"
                 }
                 Log.e("AccessibilityAgent", "Backend failure intercepted: $notice")
-                executionAttempts.clear()
-                voiceAssistantManager?.stopAllOperations()
-                activeDirectiveJob?.cancel()
+                
+                if (error == "HARD_STOP") {
+                    performTakeOverCleanup()
+                } else {
+                    executionAttempts.clear()
+                    voiceAssistantManager?.stopAllOperations()
+                    activeDirectiveJob?.cancel()
+                }
+
                 serviceScope.launch {
                     try {
                         Toast.makeText(this@AccessibilityAgentService, notice, Toast.LENGTH_LONG).show()
@@ -293,32 +352,39 @@ class AccessibilityAgentService : AccessibilityService() {
             val speechResponse = json.optString("speech_response")
             val actionType = json.optString("action_type")
             
+            val isStopDirective = executionState == "USER_TAKE_OVER" || 
+                                 actionType == "USER_TAKE_OVER" || 
+                                 actionType == "HARD_STOP"
+            
+            // Step 2: Handle multi-turn speech response and mic re-activation
+            val onSpeechFinished = {
+                serviceScope.launch {
+                    if (executionState == "PAUSE_FOR_USER_INPUT") {
+                        Log.d("AccessibilityAgent", "Directive PAUSE_FOR_USER_INPUT: Re-activating mic.")
+                        voiceAssistantManager?.startListening()
+                    } else if (isStopDirective) {
+                        Log.d("AccessibilityAgent", "Stop directive received: Performing cleanup.")
+                        performTakeOverCleanup()
+                    }
+                }
+            }
+
             if (audioResponse.isNotBlank()) {
-                try {
-                    voiceAssistantManager?.playAudioResponse(audioResponse) {
-                        serviceScope.launch {
-                            if (executionState == "PAUSE_FOR_USER_INPUT") {
-                                voiceAssistantManager?.startListening()
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("AccessibilityAgent", "Failed to play audio response", e)
-                }
+                voiceAssistantManager?.playAudioResponse(audioResponse) { onSpeechFinished() }
             } else if (speechResponse.isNotBlank()) {
-                voiceAssistantManager?.speak(speechResponse) {
-                    serviceScope.launch {
-                        if (executionState == "PAUSE_FOR_USER_INPUT") {
-                            voiceAssistantManager?.startListening()
-                        }
-                    }
-                }
-            } else if (executionState == "PAUSE_FOR_USER_INPUT") {
-                voiceAssistantManager?.startListening()
+                voiceAssistantManager?.speak(speechResponse) { onSpeechFinished() }
+            } else {
+                onSpeechFinished()
             }
 
             if (json.optBoolean("stop_listening", false)) {
                 voiceAssistantManager?.stopAudioStreaming()
+            }
+
+            // If it's a stop directive, we already scheduled cleanup in onSpeechFinished.
+            // If no speech was pending, cleanup happened immediately in the 'else' block.
+            if (isStopDirective) {
+                return
             }
 
             activeDirectiveJob?.cancel()
@@ -334,19 +400,8 @@ class AccessibilityAgentService : AccessibilityService() {
                         currentTaskId = taskId
                     }
 
-                    // Handled above for TTS/Audio sync
+                    // PAUSE_FOR_USER_INPUT: Re-activation is handled by onSpeechFinished
                     if (executionState == "PAUSE_FOR_USER_INPUT") {
-                        return@launch
-                    }
-
-                    // USER_TAKE_OVER or HARD_STOP: Stop operations and reset session
-                    if (executionState == "USER_TAKE_OVER" || actionType == "USER_TAKE_OVER" || actionType == "HARD_STOP" || error == "HARD_STOP") {
-                        voiceAssistantManager?.stopAllOperations()
-                        activeDirectiveJob?.cancel()
-                        sessionManager.resetSession()
-                        currentTaskId = null
-                        currentOriginalIntent = null
-                        
                         return@launch
                     }
 
@@ -363,38 +418,42 @@ class AccessibilityAgentService : AccessibilityService() {
                             Log.d("AccessibilityAgent", "Intercepting OPEN_APP directive locally for: $appToResolve")
                             val resolution = LauncherAppResolver.resolveLauncherApps(this@AccessibilityAgentService, appToResolve)
                             
-                            if (resolution.status == LauncherAppResolver.ResolutionStatus.MATCH_FOUND) {
-                                delay(1200) // Settlement delay for inflation
-                                sendFeedbackAfterAction(
-                                    result = ActionResult(true, "SUCCESS"),
-                                    actionType = "OPEN_APP",
-                                    targetPackage = resolution.packageName,
-                                    isCompleted = true
-                                )
-                                return@launch
-                            } else if (resolution.status == LauncherAppResolver.ResolutionStatus.AMBIGUOUS_MATCH) {
-                                val candidates = resolution.candidates.joinToString(" or ")
-                                try {
-                                    voiceAssistantManager?.speak("I found multiple matching apps: $candidates. Which one would you like?")
-                                } catch (e: Exception) {
-                                    Log.e("AccessibilityAgent", "Failed to speak ambiguous match", e)
+                            when (resolution.status) {
+                                LauncherAppResolver.ResolutionStatus.MATCH_FOUND -> {
+                                    delay(1200) // Settlement delay for inflation
+                                    sendFeedbackAfterAction(
+                                        result = ActionResult(true, "SUCCESS"),
+                                        actionType = "OPEN_APP",
+                                        targetPackage = resolution.packageName,
+                                        isCompleted = true
+                                    )
+                                    return@launch
                                 }
-                                sendFeedbackAfterAction(
-                                    result = ActionResult(false, "AMBIGUOUS_MATCH", candidates = resolution.candidates),
-                                    actionType = "OPEN_APP"
-                                )
-                                return@launch
-                            } else if (resolution.status == LauncherAppResolver.ResolutionStatus.NO_MATCH) {
-                                try {
-                                    voiceAssistantManager?.speak("I couldn't find $appToResolve. Searching the Play Store instead.")
-                                } catch (e: Exception) {
-                                    Log.e("AccessibilityAgent", "Failed to speak no match", e)
+                                LauncherAppResolver.ResolutionStatus.AMBIGUOUS_MATCH -> {
+                                    val candidates = resolution.candidates.joinToString(" or ")
+                                    try {
+                                        voiceAssistantManager?.speak("I found multiple matching apps: $candidates. Which one would you like?")
+                                    } catch (e: Exception) {
+                                        Log.e("AccessibilityAgent", "Failed to speak ambiguous match", e)
+                                    }
+                                    sendFeedbackAfterAction(
+                                        result = ActionResult(false, "AMBIGUOUS_MATCH", candidates = resolution.candidates),
+                                        actionType = "OPEN_APP"
+                                    )
+                                    return@launch
                                 }
-                                sendFeedbackAfterAction(
-                                    result = ActionResult(false, "NO_MATCH"),
-                                    actionType = "OPEN_APP"
-                                )
-                                return@launch
+                                LauncherAppResolver.ResolutionStatus.NO_MATCH -> {
+                                    try {
+                                        voiceAssistantManager?.speak("I couldn't find $appToResolve. Searching the Play Store instead.")
+                                    } catch (e: Exception) {
+                                        Log.e("AccessibilityAgent", "Failed to speak no match", e)
+                                    }
+                                    sendFeedbackAfterAction(
+                                        result = ActionResult(false, "NO_MATCH"),
+                                        actionType = "OPEN_APP"
+                                    )
+                                    return@launch
+                                }
                             }
                         }
                     }
@@ -408,7 +467,7 @@ class AccessibilityAgentService : AccessibilityService() {
                         if (LoopDetector.isLoopDetected(packageName ?: "", domHash, actionType, targetText ?: "", elements.length())) {
                             Log.e("AccessibilityAgent", "LOOP DETECTED: $actionType on $targetText")
                             sendFeedbackAfterAction(
-                                result = ActionResult(false, "LOOP_DETECTED", failure_reason = "Execution loop detected locally (3x sequential)."),
+                                result = ActionResult(false, "LOOP_DETECTED", failureReason = "Execution loop detected locally (3x sequential)."),
                                 actionType = actionType
                             )
                             return@launch
@@ -420,7 +479,7 @@ class AccessibilityAgentService : AccessibilityService() {
                         val mainActivity = MainActivity.instance
                         if (mainActivity == null) {
                             sendFeedbackAfterAction(
-                                result = ActionResult(false, "FAILED", failure_reason = "BIOMETRIC_FAILED"),
+                                result = ActionResult(false, "FAILED", failureReason = "BIOMETRIC_FAILED"),
                                 actionType = actionType
                             )
                             return@launch
@@ -441,7 +500,7 @@ class AccessibilityAgentService : AccessibilityService() {
                             onError = {
                                 serviceScope.launch {
                                     sendFeedbackAfterAction(
-                                        result = ActionResult(false, "FAILED", failure_reason = "BIOMETRIC_FAILED"),
+                                        result = ActionResult(false, "FAILED", failureReason = "BIOMETRIC_FAILED"),
                                         actionType = actionType
                                     )
                                 }
@@ -491,8 +550,6 @@ class AccessibilityAgentService : AccessibilityService() {
         actionType: String,
         targetNode: String? = null,
         targetPackage: String? = null,
-        immediate: Boolean = false,
-        debounce: Boolean = false,
         intent: String? = null,
         taskId: String? = null,
         isCompleted: Boolean = false,
@@ -512,7 +569,7 @@ class AccessibilityAgentService : AccessibilityService() {
             put("action_type", actionType) // Ensuring action_type is also sent
             put("target_node", targetNode)
             put("target_package", targetPackage ?: result.packageLaunched)
-            put("failure_reason", result.failure_reason)
+            put("failure_reason", result.failureReason)
             put("transcript", intent ?: currentOriginalIntent ?: "")
             put("user_prompt", intent ?: currentOriginalIntent ?: "")
             put("is_completed", isCompleted)

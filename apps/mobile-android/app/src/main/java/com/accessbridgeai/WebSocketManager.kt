@@ -117,8 +117,16 @@ class WebSocketManager(
                 payload.put("session_id", sessionManager.getSessionId())
             }
 
+            val type = payload.optString("type")
+            // Ensure task_id is present for intent and feedback payloads (Step 1)
+            if (type == "USER_INTENT" || type == "USER_INTENT_FEEDBACK") {
+                if (!payload.has("task_id")) {
+                    payload.put("task_id", "")
+                }
+            }
+
             // Pre-send guard: Do not send USER_INTENT if transcript or user_prompt is empty
-            if (payload.optString("type") == "USER_INTENT") {
+            if (type == "USER_INTENT") {
                 val transcript = payload.optString("transcript") // Match AccessibilityAgentService usage
                 if (transcript.isBlank()) {
                     Log.w("WebSocketManager", "Aborting send: USER_INTENT has empty/blank transcript.")

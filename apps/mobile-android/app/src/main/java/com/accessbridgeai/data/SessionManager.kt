@@ -55,6 +55,10 @@ class SessionManager(context: Context) {
         val newSessionId = UUID.randomUUID().toString()
         prefs.edit().putString(KEY_SESSION_ID, newSessionId).apply()
     }
+
+    fun clearSessionId() {
+        prefs.edit().remove(KEY_SESSION_ID).apply()
+    }
 }
 
 data class UserProfile(
