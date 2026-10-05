@@ -501,7 +501,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             };
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify(responsePayload));
-              sessionContexts.delete(sessionId);
+              logger.info({ requestId, taskId, sessionId, responsePayload }, "Sent AI planner directive to Android");
             }
             return;
           }
@@ -529,6 +529,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             };
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify(responsePayload));
+              logger.info({ requestId, taskId, sessionId, responsePayload }, "Sent AI planner directive to Android");
             }
             return;
           }
