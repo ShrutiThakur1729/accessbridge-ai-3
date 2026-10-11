@@ -76,6 +76,14 @@ fun OnboardingFlowScreen(
 
 @Composable
 fun UserDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
+    val textFieldColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = Color(0xFF2196F3),
+        unfocusedBorderColor = Color.LightGray,
+        focusedLabelColor = Color(0xFF2196F3),
+        unfocusedLabelColor = Color.Gray,
+        focusedTextColor = Color.Black,
+        unfocusedTextColor = Color.Black
+    )
     Column {
         Text("Identity Setup", style = MaterialTheme.typography.titleMedium, color = Color(0xFF2196F3))
         Spacer(modifier = Modifier.height(24.dp))
@@ -84,8 +92,10 @@ fun UserDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
             value = viewModel.fullName,
             onValueChange = { viewModel.fullName = it },
             label = { Text("Full Name") },
+            placeholder = { Text("Enter your full name") },
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(12.dp),
+            colors = textFieldColors
         )
         Spacer(modifier = Modifier.height(16.dp))
         
@@ -93,8 +103,10 @@ fun UserDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
             value = viewModel.email,
             onValueChange = { viewModel.email = it },
             label = { Text("Email Address") },
+            placeholder = { Text("name@example.com") },
             modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp)
+            shape = RoundedCornerShape(12.dp),
+            colors = textFieldColors
         )
         Spacer(modifier = Modifier.height(16.dp))
         
@@ -103,9 +115,11 @@ fun UserDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
                 value = viewModel.mobileNumber,
                 onValueChange = { viewModel.mobileNumber = it },
                 label = { Text("Mobile Number") },
+                placeholder = { Text("98765 43210") },
                 modifier = Modifier.weight(1f),
                 shape = RoundedCornerShape(12.dp),
-                prefix = { Text("+91 ") }
+                prefix = { Text("+91 ") },
+                colors = textFieldColors
             )
             Spacer(modifier = Modifier.width(8.dp))
             TextButton(onClick = { /* Trigger OTP */ }) {
@@ -118,9 +132,11 @@ fun UserDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
             value = viewModel.address,
             onValueChange = { viewModel.address = it },
             label = { Text("Full Address") },
+            placeholder = { Text("Enter your full address") },
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
-            minLines = 3
+            minLines = 3,
+            colors = textFieldColors
         )
         
         Spacer(modifier = Modifier.height(32.dp))
@@ -141,6 +157,14 @@ fun UserDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
 
 @Composable
 fun GuardianDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
+    val textFieldColors = OutlinedTextFieldDefaults.colors(
+        focusedBorderColor = Color(0xFF2196F3),
+        unfocusedBorderColor = Color.LightGray,
+        focusedLabelColor = Color(0xFF2196F3),
+        unfocusedLabelColor = Color.Gray,
+        focusedTextColor = Color.Black,
+        unfocusedTextColor = Color.Black
+    )
     Column {
         Text("Guardian Details", style = MaterialTheme.typography.titleMedium)
         Text(
@@ -154,9 +178,11 @@ fun GuardianDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
             value = viewModel.guardianName,
             onValueChange = { viewModel.guardianName = it },
             label = { Text("Guardian Full Name") },
+            placeholder = { Text("Enter guardian's full name") },
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
-            leadingIcon = { Icon(Icons.Default.Person, contentDescription = null) }
+            leadingIcon = { Icon(Icons.Default.Person, contentDescription = null) },
+            colors = textFieldColors
         )
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -164,9 +190,11 @@ fun GuardianDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
             value = viewModel.guardianEmail,
             onValueChange = { viewModel.guardianEmail = it },
             label = { Text("Guardian Email Address") },
+            placeholder = { Text("guardian@example.com") },
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
-            leadingIcon = { Icon(Icons.Default.Email, contentDescription = null) }
+            leadingIcon = { Icon(Icons.Default.Email, contentDescription = null) },
+            colors = textFieldColors
         )
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -175,9 +203,11 @@ fun GuardianDetailsStep(viewModel: OnboardingViewModel, onNext: () -> Unit) {
                 value = viewModel.guardianPhone,
                 onValueChange = { viewModel.guardianPhone = it },
                 label = { Text("Guardian Mobile Number") },
+                placeholder = { Text("98765 43210") },
                 modifier = Modifier.weight(1f),
                 shape = RoundedCornerShape(12.dp),
-                prefix = { Text("+91 ") }
+                prefix = { Text("+91 ") },
+                colors = textFieldColors
             )
             Spacer(modifier = Modifier.width(8.dp))
             TextButton(onClick = { /* Trigger OTP */ }) {
@@ -271,7 +301,11 @@ fun SafetyPromiseStep(viewModel: OnboardingViewModel, onComplete: () -> Unit) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
                 checked = viewModel.hasAgreedToSafety,
-                onCheckedChange = { viewModel.hasAgreedToSafety = it }
+                onCheckedChange = { viewModel.hasAgreedToSafety = it },
+                colors = CheckboxDefaults.colors(
+                    checkedColor = Color(0xFF2ECC71),
+                    uncheckedColor = Color.Gray
+                )
             )
             Text(
                 "I have read the Safety Protocols and agree to activate my guardian-led account...",

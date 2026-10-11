@@ -44,29 +44,8 @@ object ExecutionEngine {
                 AccessibilityAgentService.ActionResult(success, if (success) "SUCCESS" else "GESTURE_FAILED")
             }
             "OPEN_APP" -> {
-                val effectivePackage = if (!packageName.isNullOrBlank()) packageName else {
-                    // Fallback to label-based resolution if packageName is missing from directive
-                    if (!targetText.isNullOrBlank()) {
-                        val resolution = AppResolver.resolveApp(service, targetText)
-                        if (resolution.confidence == AppResolver.Confidence.HIGH_CONFIDENCE || 
-                            resolution.confidence == AppResolver.Confidence.MULTI_STEP_INTENT) {
-                            resolution.bestMatch?.packageName
-                        } else null
-                    } else null
-                }
-
-                if (!effectivePackage.isNullOrBlank()) {
-                    val pm = service.packageManager
-                    val launchIntent = pm.getLaunchIntentForPackage(effectivePackage)
-                    if (launchIntent != null) {
-                        launchIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                        service.startActivity(launchIntent)
-                        // Post-launch delay window to allow OS window transition
-                        kotlinx.coroutines.delay(800)
-                        AccessibilityAgentService.ActionResult(true, "SUCCESS")
-                    } else {
-                        AccessibilityAgentService.ActionResult(false, "NOT_INSTALLED", "App not found or not launchable.")
-                    }
+                if (!packageName.isNullOrBlank() || !targetText.isNullOrBlank()) {
+                    service.openAppByPackage(packageName, targetText)
                 } else {
                     AccessibilityAgentService.ActionResult(false, "INVALID_ARGUMENT", "Package name or app label missing.")
                 }

@@ -263,37 +263,6 @@ class PlannerService:
                     ],
                 ))
 
-        # =========================================================================
-        # APP LAUNCH FAILURE & PLAY STORE INSTALL INTERCEPTOR
-        # =========================================================================
-        if str(action_status).upper() == "FAILED" and (
-            target_action == "OPEN_APP" 
-            or (action_history and str(action_history[-1].get("action_type") or "").upper() == "OPEN_APP")
-        ):
-            app_info = resolve_app_launch(user_prompt)
-            app_name = app_info[2] if (app_info and app_info[2]) else (target_action or "the requested app")
-
-            # Store in-memory intent for the next confirmation turn
-            self._pending_install_intents[session_key] = app_name
-
-            return attach_session_metadata(ActionPlanResponse(
-                plan_id=f"plan_{uuid.uuid4().hex[:8]}",
-                session_id=session_ctx.session_id,
-                user_goal=user_prompt,
-                risk_level=risk_level,
-                total_steps=1,
-                current_step_index=0,
-                is_completed=False,
-                execution_state="AWAITING_USER_CONFIRMATION",
-                requires_confirmation=True,
-                speech_response=f"The app '{app_name}' is not installed on your phone. Would you like me to install it from the Play Store?",
-                steps=[PlanStep(
-                    step_id=1,
-                    action=ActionType.FINISH,
-                    reason="OPEN_APP failed: captured app installation intent and awaiting user confirmation.",
-                )],
-            ))
-
         # 0C. Universal Screen QA Interceptor
         qa_keywords = ("what", "which", "how much", "tell me", "read screen", "summarize", "options", "cheapest", "show options")
         prompt_lower = user_prompt.lower()

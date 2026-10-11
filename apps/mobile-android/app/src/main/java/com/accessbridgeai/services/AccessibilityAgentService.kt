@@ -3,7 +3,6 @@ package com.accessbridgeai.services
 import android.accessibilityservice.AccessibilityButtonController
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.Intent
 import android.content.pm.LauncherApps
 import android.graphics.Path
 import android.graphics.Point
@@ -18,7 +17,7 @@ import com.accessbridgeai.utils.ExecutionEngine
 import com.accessbridgeai.MainActivity
 import com.accessbridgeai.WebSocketManager
 import com.accessbridgeai.VoiceAssistantManager
-import com.accessbridgeai.utils.AppResolver
+import com.accessbridgeai.utils.LauncherAppResolver
 import com.accessbridgeai.utils.LoopDetector
 import com.accessbridgeai.data.SessionManager
 import kotlinx.coroutines.*
@@ -252,51 +251,33 @@ class AccessibilityAgentService : AccessibilityService() {
         LoopDetector.clearHistory()
 
         serviceScope.launch {
-            val resolution = AppResolver.resolveApp(this@AccessibilityAgentService, cleanIntent)
+            val gatingResult = LauncherAppResolver.evaluateLaunchIntent(this@AccessibilityAgentService, cleanIntent)
             
-            // Tier 1 & 2 Local App Resolver Interceptor
-            // AND MULTI_STEP_INTENT with a matched package
-            val nativePackage = resolution.bestMatch?.packageName
-            if (nativePackage != null && (resolution.confidence == AppResolver.Confidence.HIGH_CONFIDENCE || 
-                resolution.confidence == AppResolver.Confidence.MULTI_STEP_INTENT)) {
-                
-                val pm = packageManager
-                val launchIntent = pm.getLaunchIntentForPackage(nativePackage)
-                if (launchIntent != null) {
+            when (gatingResult) {
+                is LauncherAppResolver.LaunchGatingResult.SIMPLE_LAUNCH -> {
+                    voiceAssistantManager?.speak("Opening ${gatingResult.appLabel}")
+                    val launcherApps = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
                     try {
-                        val appLabel = resolution.bestMatch.label
-                        voiceAssistantManager?.speak("Opening $appLabel")
-                        
-                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        startActivity(launchIntent)
+                        launcherApps.startMainActivity(gatingResult.componentName, gatingResult.userHandle, null, null)
                         
                         delay(1200) // Settlement delay
-                        
-                        // If it's HIGH_CONFIDENCE, we stop here. 
-                        // If it's MULTI_STEP_INTENT, we continue to send to gateway.
-                        if (resolution.confidence == AppResolver.Confidence.HIGH_CONFIDENCE) {
-                            sendFeedbackAfterAction(
-                                result = ActionResult(true, "SUCCESS"),
-                                actionType = "OPEN_APP",
-                                targetPackage = nativePackage,
-                                intent = cleanIntent,
-                                isCompleted = true
-                            )
-                            return@launch
-                        }
+                        sendFeedbackAfterAction(
+                            result = ActionResult(true, "SUCCESS"),
+                            actionType = "OPEN_APP",
+                            targetPackage = gatingResult.packageName,
+                            intent = cleanIntent,
+                            isCompleted = true
+                        )
+                        return@launch
                     } catch (e: Exception) {
-                        Log.e("AccessibilityAgent", "Local launch failed for $nativePackage", e)
+                        Log.e("AccessibilityAgent", "Local launch failed for ${gatingResult.appLabel}", e)
                     }
                 }
-            }
-
-            when (resolution.confidence) {
-                AppResolver.Confidence.HIGH_CONFIDENCE -> {
-                    // Handled above
-                }
-                AppResolver.Confidence.AMBIGUOUS -> {
-                    val candidateLabels = resolution.candidates.map { it.label }
-                    val speech = "Did you mean ${candidateLabels.joinToString(" or ")}?"
+                is LauncherAppResolver.LaunchGatingResult.AMBIGUOUS_LAUNCH -> {
+                    val candidateLabels = gatingResult.candidates.map { 
+                        "${it.label}${if (it.isManaged) " (Work)" else ""}" 
+                    }
+                    val speech = "I found multiple matching apps: ${candidateLabels.joinToString(" and ")}. Which one did you mean?"
                     voiceAssistantManager?.speak(speech)
                     
                     sendFeedbackAfterAction(
@@ -306,20 +287,9 @@ class AccessibilityAgentService : AccessibilityService() {
                     )
                     return@launch
                 }
-                AppResolver.Confidence.NOT_INSTALLED -> {
-                    val appName = cleanIntent.replace(Regex("^(open|launch|start|go to|show me|run)\\s+", RegexOption.IGNORE_CASE), "").trim()
-                    val speech = "$appName is not installed. Download from Play Store?"
-                    voiceAssistantManager?.speak(speech)
-                    
-                    sendFeedbackAfterAction(
-                        result = ActionResult(false, "NOT_INSTALLED"),
-                        actionType = "OPEN_APP",
-                        intent = cleanIntent
-                    )
-                    return@launch
-                }
-                AppResolver.Confidence.MULTI_STEP_INTENT -> {
-                    Log.d("AccessibilityAgent", "Multi-step intent detected: $cleanIntent. Matched package: $nativePackage. Forwarding to gateway.")
+                else -> {
+                    // Bypass local execution for COMPLEX_INTENT or NO_LOCAL_MATCH
+                    Log.d("AccessibilityAgent", "Intent bypassed local gating: $cleanIntent")
                 }
             }
 
@@ -331,9 +301,6 @@ class AccessibilityAgentService : AccessibilityService() {
                 put("user_id", "default_user")
                 put("input_type", "TEXT")
                 put("session_id", sessionManager.getSessionId())
-                if (resolution.confidence == AppResolver.Confidence.MULTI_STEP_INTENT) {
-                    put("package_hint", resolution.bestMatch?.packageName)
-                }
                 if (!currentTaskId.isNullOrEmpty()) {
                     put("task_id", currentTaskId)
                 }
@@ -449,50 +416,40 @@ class AccessibilityAgentService : AccessibilityService() {
                         val appToResolve = if (!packageName.isNullOrBlank()) packageName else targetText
                         if (!appToResolve.isNullOrBlank()) {
                             Log.d("AccessibilityAgent", "Intercepting OPEN_APP directive locally for: $appToResolve")
-                            val resolution = AppResolver.resolveApp(this@AccessibilityAgentService, appToResolve)
+                            val resolution = LauncherAppResolver.resolveLauncherApps(this@AccessibilityAgentService, appToResolve)
                             
-                            when (resolution.confidence) {
-                                AppResolver.Confidence.HIGH_CONFIDENCE -> {
-                                    val bestMatch = resolution.bestMatch
-                                    if (bestMatch != null) {
-                                        val pm = packageManager
-                                        val launchIntent = pm.getLaunchIntentForPackage(bestMatch.packageName)
-                                        if (launchIntent != null) {
-                                            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                            startActivity(launchIntent)
-                                            
-                                            delay(1200) // Settlement delay for inflation
-                                            sendFeedbackAfterAction(
-                                                result = ActionResult(true, "SUCCESS"),
-                                                actionType = "OPEN_APP",
-                                                targetPackage = bestMatch.packageName,
-                                                isCompleted = true
-                                            )
-                                            return@launch
-                                        }
-                                    }
+                            when (resolution.status) {
+                                LauncherAppResolver.ResolutionStatus.MATCH_FOUND -> {
+                                    delay(1200) // Settlement delay for inflation
+                                    sendFeedbackAfterAction(
+                                        result = ActionResult(true, "SUCCESS"),
+                                        actionType = "OPEN_APP",
+                                        targetPackage = resolution.packageName,
+                                        isCompleted = true
+                                    )
+                                    return@launch
                                 }
-                                AppResolver.Confidence.AMBIGUOUS -> {
-                                    val candidates = resolution.candidates.map { it.label }.joinToString(" or ")
+                                LauncherAppResolver.ResolutionStatus.AMBIGUOUS_MATCH -> {
+                                    val candidates = resolution.candidates.joinToString(" or ")
                                     try {
-                                        voiceAssistantManager?.speak("Did you mean $candidates?")
+                                        voiceAssistantManager?.speak("I found multiple matching apps: $candidates. Which one would you like?")
                                     } catch (e: Exception) {
                                         Log.e("AccessibilityAgent", "Failed to speak ambiguous match", e)
                                     }
                                     sendFeedbackAfterAction(
-                                        result = ActionResult(false, "AMBIGUOUS_MATCH", candidates = resolution.candidates.map { it.label }),
+                                        result = ActionResult(false, "AMBIGUOUS_MATCH", candidates = resolution.candidates),
                                         actionType = "OPEN_APP"
                                     )
                                     return@launch
                                 }
-                                AppResolver.Confidence.NOT_INSTALLED, AppResolver.Confidence.MULTI_STEP_INTENT -> {
+                                LauncherAppResolver.ResolutionStatus.NO_MATCH -> {
                                     try {
-                                        voiceAssistantManager?.speak("$appToResolve is not installed. Download from Play Store?")
+                                        voiceAssistantManager?.speak("I couldn't find $appToResolve. Searching the Play Store instead.")
                                     } catch (e: Exception) {
                                         Log.e("AccessibilityAgent", "Failed to speak no match", e)
                                     }
                                     sendFeedbackAfterAction(
-                                        result = ActionResult(false, "NOT_INSTALLED"),
+                                        result = ActionResult(false, "NO_MATCH"),
                                         actionType = "OPEN_APP"
                                     )
                                     return@launch
@@ -707,11 +664,11 @@ class AccessibilityAgentService : AccessibilityService() {
 
     fun openAppByPackage(packageName: String?, appName: String? = null): ActionResult {
         val targetLabel = appName ?: packageName ?: return ActionResult(false, "FAILED", "No app name or package provided.")
-        val resolution = AppResolver.resolveApp(this, targetLabel)
-        return when (resolution.confidence) {
-            AppResolver.Confidence.HIGH_CONFIDENCE -> ActionResult(true, "SUCCESS", packageLaunched = resolution.bestMatch?.packageName)
-            AppResolver.Confidence.AMBIGUOUS -> ActionResult(false, "AMBIGUOUS_MATCH", "Ambiguous match", candidates = resolution.candidates.map { it.label })
-            AppResolver.Confidence.NOT_INSTALLED, AppResolver.Confidence.MULTI_STEP_INTENT -> ActionResult(false, "NO_MATCH", "App not found.")
+        val resolution = LauncherAppResolver.resolveApp(this, targetLabel)
+        return when (resolution.status) {
+            LauncherAppResolver.ResolutionStatus.MATCH_FOUND -> ActionResult(true, "SUCCESS", packageLaunched = resolution.packageName)
+            LauncherAppResolver.ResolutionStatus.AMBIGUOUS_MATCH -> ActionResult(false, "AMBIGUOUS_MATCH", "Ambiguous match", candidates = resolution.candidates)
+            LauncherAppResolver.ResolutionStatus.NO_MATCH -> ActionResult(false, "NO_MATCH", "App not found.")
         }
     }
 
