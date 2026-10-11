@@ -1,6 +1,7 @@
-
 package com.accessbridgeai.ui.screens
 
+import android.widget.Toast
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -13,10 +14,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.accessbridgeai.data.SessionManager
 
 // AccessBridge dark theme colors
 private val DarkBackground = Color(0xFF0B1120)
@@ -29,12 +32,15 @@ private val BorderColor = Color(0xFF334155)
 
 @Composable
 fun LoginScreen(
+    sessionManager: SessionManager? = null,
     onLoginSuccess: (String) -> Unit,
     onNavigateToSignup: () -> Unit
 ) {
+    val context = LocalContext.current
     var mobileNumber by remember { mutableStateOf("") }
     var otpSent by remember { mutableStateOf(false) }
     var otp by remember { mutableStateOf("") }
+    var isLoading by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
@@ -91,7 +97,7 @@ fun LoginScreen(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
                 color = CardBackground,
-                border = androidx.compose.foundation.BorderStroke(
+                border = BorderStroke(
                     1.dp,
                     BorderColor.copy(alpha = 0.65f)
                 )
@@ -183,12 +189,50 @@ fun LoginScreen(
 
                     Button(
                         onClick = {
+                            if (mobileNumber.length < 10) {
+                                Toast.makeText(context, "Please enter a valid 10-digit mobile number", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+
                             if (!otpSent) {
-                                otpSent = true
+                                isLoading = true
+                                if (sessionManager != null) {
+                                    sessionManager.sendOtp(mobileNumber) { success, err ->
+                                        isLoading = false
+                                        if (success) {
+                                            otpSent = true
+                                        } else {
+                                            // Fallback to offline OTP screen
+                                            otpSent = true
+                                            Toast.makeText(context, "Supabase Auth fallback: Enter 6-digit OTP", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                } else {
+                                    otpSent = true
+                                    isLoading = false
+                                }
                             } else {
-                                onLoginSuccess(mobileNumber)
+                                isLoading = true
+                                if (sessionManager != null && otp.length == 6) {
+                                    sessionManager.verifyOtp(mobileNumber, otp) { success, err ->
+                                        isLoading = false
+                                        if (success) {
+                                            onLoginSuccess(mobileNumber)
+                                        } else {
+                                            Toast.makeText(context, "OTP Verification Failed: ${err ?: "Invalid OTP"}", Toast.LENGTH_LONG).show()
+                                        }
+                                    }
+                                } else {
+                                    isLoading = false
+                                    if (otp.length == 6) {
+                                        onLoginSuccess(mobileNumber)
+                                    } else {
+                                        Toast.makeText(context, "Please enter 6-digit OTP", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
                             }
                         },
+                        enabled = !isLoading,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(52.dp),
@@ -198,11 +242,15 @@ fun LoginScreen(
                             contentColor = DarkBackground
                         )
                     ) {
-                        Text(
-                            text = if (otpSent) "Verify & Login" else "Send OTP",
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        if (isLoading) {
+                            CircularProgressIndicator(color = DarkBackground, modifier = Modifier.size(24.dp))
+                        } else {
+                            Text(
+                                text = if (otpSent) "Verify & Login" else "Send OTP",
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(18.dp))
@@ -230,7 +278,7 @@ fun LoginScreen(
 
                     OutlinedButton(
                         onClick = {
-                            // Connect Google Sign-In here when implemented.
+                            Toast.makeText(context, "Google OAuth: Configure SHA-1 in Supabase dashboard", Toast.LENGTH_LONG).show()
                         },
                         modifier = Modifier
                             .fillMaxWidth()

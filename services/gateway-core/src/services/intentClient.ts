@@ -6,6 +6,7 @@ export type PlannerActionType =
   | "OPEN_APP"
   | "CLICK"
   | "TYPE_TEXT"
+  | "SUBMIT_SEARCH"
   | "SCROLL"
   | "SWIPE_UP"
   | "SWIPE_HORIZONTAL"
@@ -72,6 +73,7 @@ export interface IntentPlanResponse {
   is_completed?: boolean | null;
   error?: string;
   session_language?: string;
+  response_language?: string;
   execution_state?: string;
   requires_confirmation?: boolean;
   approach?: string;

@@ -1,14 +1,14 @@
 package com.accessbridgeai.ui.screens
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Translate
-import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -16,25 +16,49 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+data class LanguageOption(
+    val code: String,
+    val nameInEnglish: String,
+    val nativeScript: String,
+    val isVerified: Boolean = true,
+    val icon: ImageVector = Icons.Default.Translate
+)
+
+val SUPPORTED_LANGUAGES = listOf(
+    LanguageOption("en", "English", "English", isVerified = true, icon = Icons.Default.Language),
+    LanguageOption("hi", "Hindi", "हिन्दी", isVerified = true),
+    LanguageOption("mr", "Marathi", "मराठी", isVerified = true),
+    LanguageOption("bn", "Bengali", "বাংলা", isVerified = false),
+    LanguageOption("ta", "Tamil", "தமிழ்", isVerified = false),
+    LanguageOption("te", "Telugu", "తెలుగు", isVerified = false),
+    LanguageOption("kn", "Kannada", "ಕನ್ನಡ", isVerified = false),
+    LanguageOption("gu", "Gujarati", "ગુજરાતી", isVerified = false),
+    LanguageOption("pa", "Punjabi", "ਪੰਜਾਬੀ", isVerified = false),
+    LanguageOption("ml", "Malayalam", "മലയാളം", isVerified = false)
+)
 
 @Composable
 fun LanguageScreen(
     onLanguageSelected: (String) -> Unit
 ) {
     var selectedLanguage by remember { mutableStateOf("en") }
+    val scrollState = rememberScrollState()
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(24.dp)
+            .verticalScroll(scrollState)
     ) {
         IconButton(onClick = { /* Back */ }) {
             Icon(Icons.Default.Language, contentDescription = "Back")
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
         Text(
             text = "Choose Language",
@@ -42,7 +66,7 @@ fun LanguageScreen(
             fontWeight = FontWeight.Bold
         )
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
         Text(
             text = "Welcome to Access Bridge",
@@ -51,13 +75,13 @@ fun LanguageScreen(
         )
 
         Text(
-            text = "Please select your preferred language to continue the setup.",
+            text = "Select your preferred language for assistant responses.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 8.dp)
+            modifier = Modifier.padding(top = 4.dp)
         )
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
         Surface(
             color = Color(0xFFE3F2FD),
@@ -65,7 +89,7 @@ fun LanguageScreen(
             modifier = Modifier.fillMaxWidth()
         ) {
             Row(
-                modifier = Modifier.padding(16.dp),
+                modifier = Modifier.padding(14.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
@@ -75,44 +99,36 @@ fun LanguageScreen(
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Text(
-                    text = "This will be the primary language used for all voice commands and safety alerts.",
+                    text = "Your preference is saved to your profile and used for responses.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color(0xFF1976D2)
                 )
             }
         }
 
+        Spacer(modifier = Modifier.height(20.dp))
+
+        Column(
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            SUPPORTED_LANGUAGES.forEach { lang ->
+                LanguageCard(
+                    title = lang.nameInEnglish,
+                    subtitle = if (lang.isVerified) "(${lang.nativeScript})" else "(${lang.nativeScript} • Coming Soon)",
+                    icon = lang.icon,
+                    isSelected = selectedLanguage == lang.code,
+                    isEnabled = lang.isVerified,
+                    onClick = {
+                        if (lang.isVerified) {
+                            selectedLanguage = lang.code
+                        }
+                    }
+                )
+            }
+        }
+
         Spacer(modifier = Modifier.height(24.dp))
-
-        LanguageCard(
-            title = "English",
-            subtitle = "(English)",
-            icon = Icons.Default.Language,
-            isSelected = selectedLanguage == "en",
-            onClick = { selectedLanguage = "en" }
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        LanguageCard(
-            title = "Hindi",
-            subtitle = "(हिंदी)",
-            icon = Icons.Default.Translate,
-            isSelected = selectedLanguage == "hi",
-            onClick = { selectedLanguage = "hi" }
-        )
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        LanguageCard(
-            title = "Marathi",
-            subtitle = "(मराठी)",
-            icon = Icons.Default.Translate,
-            isSelected = selectedLanguage == "mr",
-            onClick = { selectedLanguage = "mr" }
-        )
-
-        Spacer(modifier = Modifier.weight(1f))
 
         Button(
             onClick = { onLanguageSelected(selectedLanguage) },
@@ -125,13 +141,13 @@ fun LanguageScreen(
             Text(text = "Continue", fontSize = 18.sp, fontWeight = FontWeight.Bold)
         }
 
+        Spacer(modifier = Modifier.height(12.dp))
+
         Text(
             text = "SECURE ONBOARDING • STEP 1 OF 4",
             style = MaterialTheme.typography.labelSmall,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 16.dp),
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Center,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
@@ -143,6 +159,7 @@ fun LanguageCard(
     subtitle: String,
     icon: ImageVector,
     isSelected: Boolean,
+    isEnabled: Boolean = true,
     onClick: () -> Unit
 ) {
     Surface(
@@ -150,43 +167,56 @@ fun LanguageCard(
         shape = RoundedCornerShape(16.dp),
         border = BorderStroke(
             width = if (isSelected) 2.dp else 1.dp,
-            color = if (isSelected) Color(0xFF2ECC71) else Color.LightGray
+            color = when {
+                isSelected -> Color(0xFF2ECC71)
+                !isEnabled -> Color.LightGray.copy(alpha = 0.5f)
+                else -> Color.LightGray
+            }
         ),
-        color = MaterialTheme.colorScheme.surface,
+        color = if (isEnabled) MaterialTheme.colorScheme.surface else Color(0xFFFAFAFA),
         modifier = Modifier.fillMaxWidth()
     ) {
         Row(
             modifier = Modifier
-                .padding(16.dp)
+                .padding(14.dp)
                 .fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Surface(
                 shape = RoundedCornerShape(12.dp),
-                color = if (isSelected) Color(0xFFE8F5E9) else Color(0xFFF5F5F5),
-                modifier = Modifier.size(48.dp)
+                color = when {
+                    isSelected -> Color(0xFFE8F5E9)
+                    !isEnabled -> Color(0xFFEEEEEE)
+                    else -> Color(0xFFF5F5F5)
+                },
+                modifier = Modifier.size(44.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
                         icon,
                         contentDescription = null,
-                        tint = if (isSelected) Color(0xFF2ECC71) else Color.Gray
+                        tint = when {
+                            isSelected -> Color(0xFF2ECC71)
+                            !isEnabled -> Color.LightGray
+                            else -> Color.Gray
+                        }
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.width(16.dp))
+            Spacer(modifier = Modifier.width(14.dp))
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = title,
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = if (isEnabled) MaterialTheme.colorScheme.onSurface else Color.Gray
                 )
                 Text(
                     text = subtitle,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isEnabled) MaterialTheme.colorScheme.onSurfaceVariant else Color.LightGray
                 )
             }
 

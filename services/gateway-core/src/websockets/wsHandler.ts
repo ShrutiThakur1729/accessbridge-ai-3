@@ -679,7 +679,7 @@ const mergedBlacklist = Array.from(mergedBlacklistSet);
         const responsePayload: ResponsePayload = {
           task_id: taskId,
           session_id: sessionId,
-          language_code: normalizeLanguage(aiPlan.session_language, sessionLanguage),
+          language_code: normalizeLanguage(aiPlan.response_language || aiPlan.session_language, sessionLanguage),
           execution_state: isHardStop ? "ERROR" : aiPlan.execution_state || "EXECUTING",
           requires_confirmation: aiPlan.requires_confirmation,
           approach: isHardStop ? "SAFETY_INTERCEPT" : aiPlan.approach || "SERVER_REPLANNING",

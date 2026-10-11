@@ -13,6 +13,7 @@ class ActionType(str, Enum):
     OPEN_APP = "OPEN_APP"
     CLICK = "CLICK"
     TYPE_TEXT = "TYPE_TEXT"
+    SUBMIT_SEARCH = "SUBMIT_SEARCH"
     SCROLL = "SCROLL"
     CONFIRM_BIOMETRIC = "CONFIRM_BIOMETRIC"
     SYSTEM_BACK = "SYSTEM_BACK"
@@ -92,6 +93,7 @@ class ActionPlanResponse(BaseModel):
     is_completed: Optional[bool] = Field(default=None, description="Planner-declared terminal state")
     error: Optional[str] = Field(default=None, description="Machine-readable non-terminal planner error")
     session_language: Optional[str] = Field(default=None, description="BCP-47 language for the client TTS response")
+    response_language: Optional[str] = Field(default="en", description="Target response language code: en, hi, mr")
     execution_state: Optional[str] = Field(default=None, description="Planner state-machine state")
     requires_confirmation: Optional[bool] = Field(default=None, description="True if turn requires verbal user confirmation")
     approach: Optional[str] = Field(default=None, description="LOCAL_RESOLUTION or SERVER_REPLANNING")

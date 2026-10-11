@@ -12,26 +12,32 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.text.TextUtils
 import android.util.Log
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.biometric.BiometricPrompt
 import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.accessbridgeai.data.SessionManager
 import com.accessbridgeai.data.UserProfile
+import com.accessbridgeai.services.AccessibilityAgentService
 import com.accessbridgeai.ui.OnboardingViewModel
 import com.accessbridgeai.ui.screens.*
 import com.accessbridgeai.ui.theme.AccessbridgeAIITheme
 import org.json.JSONObject
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
+
+    companion object {
+        private var _instance: MainActivity? = null
+        val instance: MainActivity? get() = _instance
+    }
 
     private lateinit var sessionManager: SessionManager
     private val onboardingViewModel: OnboardingViewModel by viewModels()
@@ -40,24 +46,25 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        _instance = this
         sessionManager = SessionManager(this)
         enableEdgeToEdge()
-        
+
         setContent {
             AccessbridgeAIITheme {
                 val navController = rememberNavController()
-                
+
                 val serviceInstance by AccessibilityAgentService.serviceInstance.collectAsState()
                 val partialTranscript by serviceInstance?.partialTranscript?.collectAsState("") ?: remember { mutableStateOf("") }
                 val speechState by serviceInstance?.speechState?.collectAsState("IDLE") ?: remember { mutableStateOf("IDLE") }
                 val connectionStatus by serviceInstance?.connectionStatus?.collectAsState(false) ?: remember { mutableStateOf(false) }
-                
+
                 val startDestination = if (sessionManager.isLoggedIn) "dashboard" else "welcome"
 
                 val permissionLauncher = rememberLauncherForActivityResult(
-                    ActivityResultContracts.RequestPermission()
-                ) { isGranted ->
-                    if (isGranted) {
+                    ActivityResultContracts.RequestMultiplePermissions()
+                ) { permissions ->
+                    if (permissions[Manifest.permission.RECORD_AUDIO] == true) {
                         AccessibilityAgentService.instance?.startAssistant()
                     }
                 }
@@ -75,17 +82,17 @@ class MainActivity : ComponentActivity() {
                                 onboardingViewModel.selectedLanguage = lang
                                 // Immediate update to the running service if active
                                 AccessibilityAgentService.instance?.let { service ->
-                                    service.updateLanguage(lang)
-                                    
+                                    service.voiceAssistantManager?.setLanguage(lang)
+
                                     // Provide TTS confirmation of language change
                                     val confirmation = when (lang) {
-                                        "hi" -> "Óñ¡Óñ¥ÓñÀÓñ¥ Óñ╣Óñ┐ÓñéÓñªÓÑÇ Óñ«ÓÑçÓñé Óñ¼ÓñªÓñ▓ ÓñªÓÑÇ ÓñùÓñê Óñ╣ÓÑê"
-                                        "mr" -> "Óñ¡Óñ¥ÓñÀÓñ¥ Óñ«Óñ░Óñ¥ÓñáÓÑÇÓññ Óñ¼ÓñªÓñ▓Óñ▓ÓÑÇ ÓñåÓñ╣ÓÑç"
+                                        "hi" -> "भाषा हिंदी में बदल दी गई है"
+                                        "mr" -> "भाषा मराठीत बदलली आहे"
                                         else -> "Language set to English"
                                     }
-                                    service.speak(confirmation, lang)
+                                    service.voiceAssistantManager?.speak(confirmation, lang)
                                 }
-                                
+
                                 navController.navigate("onboarding")
                             }
                         )
@@ -103,6 +110,7 @@ class MainActivity : ComponentActivity() {
                     }
                     composable("login") {
                         LoginScreen(
+                            sessionManager = sessionManager,
                             onLoginSuccess = { phone ->
                                 sessionManager.isLoggedIn = true
                                 navController.navigate("dashboard") {
@@ -132,13 +140,11 @@ class MainActivity : ComponentActivity() {
                                 if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                                     AccessibilityAgentService.instance?.startAssistant()
                                 } else {
-                                    permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    permissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_CONTACTS))
                                 }
                             },
                             onUpdateServerUrl = { newUrl ->
                                 sessionManager.serverUrl = newUrl
-                                // Optional: You might want to restart the service components here
-                                // but the prompt doesn't explicitly ask for it.
                             },
                             onLogout = {
                                 sessionManager.logout()
@@ -202,6 +208,43 @@ class MainActivity : ComponentActivity() {
         }
         Log.d("MainActivity", "Registration Payload: $payload")
         AccessibilityAgentService.instance?.sendPayload(payload)
+    }
+
+    override fun onDestroy() {
+        if (_instance == this) _instance = null
+        super.onDestroy()
+    }
+
+    fun showBiometricPrompt(onSuccess: () -> Unit, onError: () -> Unit) {
+        val executor = ContextCompat.getMainExecutor(this)
+        val biometricPrompt = BiometricPrompt(this, executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    super.onAuthenticationError(errorCode, errString)
+                    Log.e("MainActivity", "Authentication error: $errString")
+                    onError()
+                }
+
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    super.onAuthenticationSucceeded(result)
+                    Log.d("MainActivity", "Authentication succeeded!")
+                    onSuccess()
+                }
+
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+                    Log.w("MainActivity", "Authentication failed")
+                    onError()
+                }
+            })
+
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Security Authentication Required")
+            .setSubtitle("Authenticate to proceed")
+            .setNegativeButtonText("Cancel")
+            .build()
+
+        biometricPrompt.authenticate(promptInfo)
     }
 }
 

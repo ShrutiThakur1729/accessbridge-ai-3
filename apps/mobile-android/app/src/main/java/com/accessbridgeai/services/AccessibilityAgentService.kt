@@ -384,6 +384,7 @@ class AccessibilityAgentService : AccessibilityService() {
             val executionState = json.optString("execution_state")
             val speechResponse = json.optString("speech_response")
             val actionType = json.optString("action_type")
+            val languageCode = json.optString("language_code", "en-IN")
             
             val isStopDirective = executionState == "USER_TAKE_OVER" || 
                                  actionType == "USER_TAKE_OVER" || 
@@ -405,7 +406,7 @@ class AccessibilityAgentService : AccessibilityService() {
             if (audioResponse.isNotBlank()) {
                 voiceAssistantManager?.playAudioResponse(audioResponse) { onSpeechFinished() }
             } else if (speechResponse.isNotBlank()) {
-                voiceAssistantManager?.speak(speechResponse) { onSpeechFinished() }
+                voiceAssistantManager?.speak(speechResponse, languageCode) { onSpeechFinished() }
             } else {
                 onSpeechFinished()
             }
@@ -466,7 +467,7 @@ class AccessibilityAgentService : AccessibilityService() {
                                                 result = ActionResult(true, "SUCCESS"),
                                                 actionType = "OPEN_APP",
                                                 targetPackage = bestMatch.packageName,
-                                                isCompleted = true
+                                                isCompleted = isCompleted
                                             )
                                             return@launch
                                         }

@@ -1,15 +1,23 @@
 package com.accessbridgeai.utils
 
+import android.Manifest
 import android.accessibilityservice.AccessibilityService
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.util.Log
+import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.content.ContextCompat
 import com.accessbridgeai.services.AccessibilityAgentService
+import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 object ExecutionEngine {
 
     /**
      * Executes the directive action using the provided AccessibilityAgentService.
-     * Handles GO_HOME, OPEN_APP, CLICK, TYPE_TEXT, SCROLL, and gestures.
+     * Handles GO_HOME, OPEN_APP, CLICK, TYPE_TEXT, SUBMIT_SEARCH, SCROLL, CALL_CONTACT, and gestures.
      * 
      * ALL GESTURE EXECUTION MUST USE UNIVERSAL ACCESSIBILITY APIS AND COORDINATES.
      * DO NOT HARDCODE APP-SPECIFIC UI LABELS OR IDS.
@@ -19,6 +27,7 @@ object ExecutionEngine {
         val targetText = json.optString("target_text")
         val packageName = json.optString("package_name")
         val textToType = json.optString("text_to_type")
+        val inputData = json.optString("input_data")
         val scrollDirection = json.optString("scroll_direction", "DOWN")
         val executionMode = json.optString("execution_mode")
         
@@ -45,7 +54,6 @@ object ExecutionEngine {
             }
             "OPEN_APP" -> {
                 val effectivePackage = if (!packageName.isNullOrBlank()) packageName else {
-                    // Fallback to label-based resolution if packageName is missing from directive
                     if (!targetText.isNullOrBlank()) {
                         val resolution = AppResolver.resolveApp(service, targetText)
                         if (resolution.confidence == AppResolver.Confidence.HIGH_CONFIDENCE || 
@@ -57,18 +65,120 @@ object ExecutionEngine {
 
                 if (!effectivePackage.isNullOrBlank()) {
                     val pm = service.packageManager
+                    val query = when {
+                        !textToType.isNullOrBlank() -> textToType
+                        !inputData.isNullOrBlank() -> inputData
+                        else -> ""
+                    }
+
+                    if (query.isNotBlank() && SearchIntentRegistry.hasSearchSupport(effectivePackage)) {
+                        var launched: Boolean? = null
+                        try {
+                            launched = SearchIntentRegistry.launchInAppSearch(service, effectivePackage, query)
+                        } catch (e: Exception) {
+                            Log.e("ExecutionEngine", "SearchIntentRegistry launch error: ${e.message}")
+                        }
+
+                        if (launched == true) {
+                            delay(1200)
+                            return AccessibilityAgentService.ActionResult(true, "SUCCESS", packageLaunched = effectivePackage)
+                        }
+
+                        // Fall back to plain launcher intent if search intent returned null/false or threw exception
+                        val launchIntent = pm.getLaunchIntentForPackage(effectivePackage)
+                        if (launchIntent != null) {
+                            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            service.startActivity(launchIntent)
+                            delay(1200)
+                            return AccessibilityAgentService.ActionResult(
+                                true,
+                                "SEARCH_INTENT_UNAVAILABLE",
+                                packageLaunched = effectivePackage
+                            )
+                        } else {
+                            return AccessibilityAgentService.ActionResult(
+                                false,
+                                "NOT_INSTALLED",
+                                "App not found or not launchable."
+                            )
+                        }
+                    }
+
                     val launchIntent = pm.getLaunchIntentForPackage(effectivePackage)
                     if (launchIntent != null) {
-                        launchIntent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         service.startActivity(launchIntent)
-                        // Post-launch delay window to allow OS window transition
-                        kotlinx.coroutines.delay(800)
-                        AccessibilityAgentService.ActionResult(true, "SUCCESS")
+                        delay(1200)
+                        AccessibilityAgentService.ActionResult(true, "SUCCESS", packageLaunched = effectivePackage)
                     } else {
                         AccessibilityAgentService.ActionResult(false, "NOT_INSTALLED", "App not found or not launchable.")
                     }
                 } else {
                     AccessibilityAgentService.ActionResult(false, "INVALID_ARGUMENT", "Package name or app label missing.")
+                }
+            }
+            "CALL_CONTACT", "DIAL_CONTACT" -> {
+                val query = when {
+                    !targetText.isNullOrBlank() -> targetText
+                    !inputData.isNullOrBlank() -> inputData
+                    !textToType.isNullOrBlank() -> textToType
+                    else -> ""
+                }
+                if (query.isNotBlank()) {
+                    if (ContextCompat.checkSelfPermission(
+                            service,
+                            Manifest.permission.READ_CONTACTS
+                        ) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        Log.w("ExecutionEngine", "READ_CONTACTS permission missing")
+                        AccessibilityAgentService.ActionResult(
+                            false,
+                            "PERMISSION_REQUIRED",
+                            "Contacts permission required to resolve '$query'."
+                        )
+                    } else {
+                        val matches = ContactResolver.searchContactByName(service, query)
+                        when {
+                            matches.size == 1 -> {
+                                val contact = matches[0]
+                                Log.d("ExecutionEngine", "Resolved single contact: ${contact.displayName} -> ${contact.phoneNumber}")
+                                val dialIntent = Intent(Intent.ACTION_DIAL).apply {
+                                    data = Uri.parse("tel:${contact.phoneNumber}")
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                try {
+                                    service.startActivity(dialIntent)
+                                    AccessibilityAgentService.ActionResult(
+                                        true,
+                                        "DIALER_OPENED",
+                                        packageLaunched = "com.android.dialer"
+                                    )
+                                } catch (e: Exception) {
+                                    AccessibilityAgentService.ActionResult(false, "CALL_FAILED", e.message)
+                                }
+                            }
+                            matches.size > 1 -> {
+                                val candidateNames = matches.map { "${it.displayName} (${it.phoneNumber})" }
+                                Log.d("ExecutionEngine", "Ambiguous contact matches for '$query': $candidateNames")
+                                AccessibilityAgentService.ActionResult(
+                                    false,
+                                    "AMBIGUOUS_CONTACT_MATCH",
+                                    failureReason = "Found ${matches.size} contacts for '$query'. Please clarify.",
+                                    candidates = candidateNames
+                                )
+                            }
+                            else -> {
+                                Log.w("ExecutionEngine", "No contacts matching '$query'")
+                                AccessibilityAgentService.ActionResult(
+                                    false,
+                                    "NO_CONTACT_MATCH",
+                                    failureReason = "No contact matching '$query' found in phonebook."
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    AccessibilityAgentService.ActionResult(false, "INVALID_ARGUMENT", "Contact name missing.")
                 }
             }
             "CLICK" -> {
@@ -79,14 +189,41 @@ object ExecutionEngine {
                 }
             }
             "TYPE_TEXT" -> {
-                if (!textToType.isNullOrBlank()) {
-                    service.typeTextIntoFocusedNode(textToType)
+                val contentToType = if (!textToType.isNullOrBlank()) textToType else inputData
+                if (!contentToType.isNullOrBlank()) {
+                    service.typeTextIntoFocusedNode(contentToType)
                 } else {
                     AccessibilityAgentService.ActionResult(false, "INVALID_ARGUMENT", "Text to type missing.")
                 }
             }
+            "SUBMIT_SEARCH" -> {
+                val root = service.findActiveRoot()
+                if (root == null) {
+                    AccessibilityAgentService.ActionResult(false, "NO_ROOT", "Active window root not found.")
+                } else {
+                    val focusedNode = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                    var success = false
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && focusedNode != null) {
+                        success = focusedNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                    }
+
+                    if (success) {
+                        AccessibilityAgentService.ActionResult(true, "SUCCESS")
+                    } else {
+                        val clickResult = service.clickElementByText("Search")
+                        if (clickResult.success) {
+                            clickResult
+                        } else {
+                            AccessibilityAgentService.ActionResult(
+                                false,
+                                "IME_ENTER_FAILED",
+                                "IME_ENTER action not supported or returned false."
+                            )
+                        }
+                    }
+                }
+            }
             "SCROLL" -> {
-                // Dynamic scroll based on direction primitive
                 service.performScroll(scrollDirection)
             }
             "SWIPE_UP" -> {

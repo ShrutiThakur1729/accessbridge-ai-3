@@ -23,6 +23,21 @@ export interface TelemetryPayload {
  * to be absent, null, or empty.
  * Returns a normalized TelemetryPayload or null if validation fails.
  */
+function sanitizePii(text: string | null | undefined): string | null {
+  if (!text) return null;
+  let clean = text
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "[REDACTED_EMAIL]")
+    .replace(/(?:\+?\d{1,3}[\s-]?)?\(?\d{3,5}\)?[\s-]?\d{3,5}[\s-]?\d{3,5}/g, "[REDACTED_PHONE]")
+    .replace(/\b(?:\d[ -]*?){13,19}\b/g, "[REDACTED_CARD]");
+  return clean.trim() || null;
+}
+
+import crypto from "crypto";
+
+function anonymizeSessionId(id: string): string {
+  return crypto.createHash("sha256").update(id).digest("hex").slice(0, 16);
+}
+
 export function validateTelemetryPayload(
   data: Record<string, unknown>
 ): TelemetryPayload | null {
@@ -40,7 +55,6 @@ export function validateTelemetryPayload(
     }
   }
 
-  // targetLabel: accept string or null/undefined; reject non-string truthy values
   if (
     data.targetLabel !== undefined &&
     data.targetLabel !== null &&
@@ -49,16 +63,16 @@ export function validateTelemetryPayload(
     return null;
   }
 
-  const rawLabel =
-    typeof data.targetLabel === "string" ? data.targetLabel.trim() : null;
+  const rawLabel = typeof data.targetLabel === "string" ? data.targetLabel.trim() : null;
+  const rawReason = data.failureReason as string;
 
   return {
-    sessionId: (data.sessionId as string).trim(),
+    sessionId: anonymizeSessionId((data.sessionId as string).trim()),
     targetAppPackage: (data.targetAppPackage as string).trim(),
     failedAction: (data.failedAction as string).trim(),
-    failureReason: (data.failureReason as string).trim(),
+    failureReason: sanitizePii(rawReason) || "UNKNOWN_FAILURE",
     timestamp: (data.timestamp as string).trim(),
-    targetLabel: rawLabel || null,
+    targetLabel: sanitizePii(rawLabel),
   };
 }
 
