@@ -9,16 +9,6 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
-import android.media.MediaPlayer
-import android.media.ToneGenerator
-import android.media.AudioManager
-import android.util.Base64
-import org.json.JSONObject
-import java.io.File
-import java.io.FileOutputStream
 import java.util.Locale
 
 class VoiceAssistantManager(
@@ -31,18 +21,13 @@ class VoiceAssistantManager(
     private var speechRecognizer: SpeechRecognizer? = null
     private var textToSpeech: TextToSpeech? = null
     private var isTtsInitialized = false
-    private var mediaPlayer: MediaPlayer? = null
-    private var audioFocusRequest: Any? = null // AudioFocusRequest on API 26+
-    @Volatile
-    private var isRecording = false
-
-    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var currentLanguageCode: String = "en-IN"
 
     init {
         // Initialize TTS
         textToSpeech = TextToSpeech(context, this)
 
-        // Initialize STT if available (Fallback/Phase 1)
+        // Initialize STT if available
         val isSttAvailable = SpeechRecognizer.isRecognitionAvailable(context)
         Log.d("VoiceManager", "Speech Recognition Available: $isSttAvailable")
         if (isSttAvailable) {
@@ -51,194 +36,31 @@ class VoiceAssistantManager(
         }
     }
 
-    // --- Phase 2: CHIME & AUDIO STREAMING ---
-
-    /**
-     * Plays a subtle chime to acknowledge user input activation.
-     */
-    fun playChime() {
-        try {
-            val toneG = ToneGenerator(AudioManager.STREAM_ALARM, 80)
-            toneG.startTone(ToneGenerator.TONE_CDMA_CONFIRM, 150)
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Chime failed", e)
+    fun setLanguage(code: String) {
+        val bcp47 = when (code) {
+            "en" -> "en-IN"
+            "hi" -> "hi-IN"
+            "mr" -> "mr-IN"
+            else -> "en-IN"
         }
-    }
-
-    /**
-     * Starts capturing raw audio chunks and streams them via the provided callback.
-     * Used for background listening without opening the main UI.
-     */
-    fun startAudioStreaming(taskId: String, onChunk: (JSONObject) -> Unit) {
-        if (isRecording) return
-        
-        val sampleRate = 16000
-        val channelConfig = AudioFormat.CHANNEL_IN_MONO
-        val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-        val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-
-        try {
-            val audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                bufferSize
-            )
-
-            if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e("VoiceManager", "AudioRecord initialization failed")
-                return
+        currentLanguageCode = bcp47
+        if (isTtsInitialized) {
+            val locale = Locale.forLanguageTag(bcp47)
+            val result = textToSpeech?.setLanguage(locale)
+            if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                Log.e("VoiceManager", "TTS Language not supported: $bcp47")
             }
-
-            audioRecord.startRecording()
-            isRecording = true
-            onSpeechStateChanged("LISTENING")
-
-            Thread {
-                try {
-                    val buffer = ByteArray(bufferSize)
-                    while (isRecording) {
-                        val read = audioRecord.read(buffer, 0, buffer.size)
-                        if (read > 0) {
-                            val chunk = JSONObject().apply {
-                                put("type", "AUDIO_CHUNK")
-                                put("task_id", taskId)
-                                put("audio", Base64.encodeToString(buffer, 0, read, Base64.NO_WRAP))
-                                put("timestamp", System.currentTimeMillis())
-                            }
-                            onChunk(chunk)
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("VoiceManager", "Error in audio streaming loop", e)
-                } finally {
-                    try {
-                        audioRecord.stop()
-                        audioRecord.release()
-                    } catch (e: Exception) {
-                        Log.e("VoiceManager", "Error releasing AudioRecord", e)
-                    }
-                    Log.d("VoiceManager", "Audio streaming thread stopped.")
-                }
-            }.start()
-        } catch (e: SecurityException) {
-            Log.e("VoiceManager", "Microphone permission denied", e)
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Failed to start AudioRecord", e)
         }
+        Log.d("VoiceManager", "Language set to: $currentLanguageCode")
     }
 
-    fun stopAudioStreaming() {
-        isRecording = false
-    }
-
-    /**
-     * Halts all active audio operations (TTS, Streaming, Playback) immediately.
-     */
-    fun stopAllOperations() {
-        isRecording = false
-        mediaPlayer?.let {
-            if (it.isPlaying) it.stop()
-            it.release()
-        }
-        mediaPlayer = null
-        textToSpeech?.stop()
-        onSpeechStateChanged("IDLE")
-    }
-
-    // --- Phase 3: BACKGROUND AUDIO PLAYBACK (TTS) ---
-
-    fun playAudioResponse(base64Audio: String, onFinished: (() -> Unit)? = null) {
-        if (base64Audio.isBlank()) {
-            Log.w("VoiceManager", "playAudioResponse: Received empty or blank audio data.")
-            onFinished?.invoke()
-            return
-        }
-        try {
-            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val audioBytes = Base64.decode(base64Audio, Base64.DEFAULT)
-            
-            val tempFile = File.createTempFile("tts_audio_resp", ".mp3", context.cacheDir)
-            FileOutputStream(tempFile).use { it.write(audioBytes) }
-
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
-            
-            mediaPlayer = MediaPlayer().apply {
-                val usage = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                    android.media.AudioAttributes.USAGE_ASSISTANT
-                } else {
-                    android.media.AudioAttributes.USAGE_MEDIA
-                }
-                
-                val playbackAttributes = android.media.AudioAttributes.Builder()
-                    .setUsage(usage)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-                setAudioAttributes(playbackAttributes)
-                
-                setDataSource(tempFile.absolutePath)
-                setOnPreparedListener { 
-                    val result = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                        val request = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                            .setAudioAttributes(playbackAttributes)
-                            .build()
-                        audioFocusRequest = request
-                        audioManager.requestAudioFocus(request)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                    }
-
-                    if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-                        start()
-                        onSpeechStateChanged("SPEAKING")
-                    }
-                }
-                setOnCompletionListener { 
-                    it.release()
-                    mediaPlayer = null
-                    if (tempFile.exists()) tempFile.delete()
-                    
-                    mainHandler.post {
-                        onSpeechStateChanged("IDLE")
-                        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                            audioFocusRequest?.let { req ->
-                                audioManager.abandonAudioFocusRequest(req as android.media.AudioFocusRequest)
-                            }
-                            audioFocusRequest = null
-                        } else {
-                            @Suppress("DEPRECATION")
-                            audioManager.abandonAudioFocus(null)
-                        }
-                        onFinished?.invoke()
-                    }
-                }
-                setOnErrorListener { mp, what, extra ->
-                    Log.e("VoiceManager", "MediaPlayer error: $what, $extra")
-                    if (tempFile.exists()) tempFile.delete()
-                    mainHandler.post {
-                        onSpeechStateChanged("IDLE")
-                        onFinished?.invoke()
-                    }
-                    false
-                }
-                prepareAsync()
-            }
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Error playing audio response", e)
-            onSpeechStateChanged("IDLE")
-            onFinished?.invoke()
-        }
-    }
-
-    // --- 1. TEXT-TO-SPEECH (TTS) LOGIC (LOCAL) ---
+    // --- 1. TEXT-TO-SPEECH (TTS) LOGIC ---
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            val result = textToSpeech?.setLanguage(Locale.getDefault())
+            val locale = Locale.forLanguageTag(currentLanguageCode)
+            val result = textToSpeech?.setLanguage(locale)
             if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                Log.e("VoiceManager", "TTS Language not supported")
+                Log.e("VoiceManager", "TTS Language not supported: $currentLanguageCode")
             } else {
                 isTtsInitialized = true
             }
@@ -247,49 +69,50 @@ class VoiceAssistantManager(
         }
     }
 
-    fun speak(text: String, onFinished: (() -> Unit)? = null) {
-        if (!isTtsInitialized || text.isBlank()) {
-            Log.d("VoiceManager", "speak: Skipping empty or blank text.")
-            onFinished?.invoke()
-            return
+    fun speak(text: String, languageCode: String? = null) {
+        if (!isTtsInitialized) return
+        
+        // Handle temporary language override for TTS
+        val finalLanguage = if (languageCode != null) {
+            when (languageCode) {
+                "en" -> "en-IN"
+                "hi" -> "hi-IN"
+                "mr" -> "mr-IN"
+                else -> languageCode // Backend might send full tag
+            }
+        } else {
+            currentLanguageCode
         }
-        try {
-            onSpeechStateChanged("SPEAKING")
-            textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "AccessBridgeTTS")
+        
+        Log.d("VoiceManager", "TTS_LANGUAGE:$finalLanguage")
+        textToSpeech?.setLanguage(Locale.forLanguageTag(finalLanguage))
 
-            // Listen for when speech finishes to reset state
-            textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) {
-                    mainHandler.post {
-                        onSpeechStateChanged("IDLE")
-                        onFinished?.invoke()
-                    }
-                }
+        onSpeechStateChanged("SPEAKING")
+        Log.d("VoiceManager", "TTS_RESULT: Speaking text")
+        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "AccessBridgeTTS")
 
-                override fun onError(utteranceId: String?) {
-                    mainHandler.post {
-                        onSpeechStateChanged("IDLE")
-                        onFinished?.invoke()
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "TTS Speak failed", e)
-            onSpeechStateChanged("IDLE")
-            onFinished?.invoke()
-        }
+        // Listen for when speech finishes to reset state
+        textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                onSpeechStateChanged("IDLE")
+            }
+            override fun onError(utteranceId: String?) {
+                onSpeechStateChanged("IDLE")
+            }
+        })
     }
 
-    // --- 2. SPEECH-TO-TEXT (STT) LOGIC (LEGACY/PHASE 1) ---
+    // --- 2. SPEECH-TO-TEXT (STT) LOGIC ---
     fun startListening() {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toString())
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentLanguageCode)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         }
-        Log.d("VoiceManager", "startListening() called")
+        Log.d("VoiceManager", "STT_START")
+        Log.d("VoiceManager", "STT_LANGUAGE:$currentLanguageCode")
         onSpeechStateChanged("LISTENING")
         speechRecognizer?.startListening(intent)
     }
@@ -319,31 +142,33 @@ class VoiceAssistantManager(
                     SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "RecognitionService busy"
                     SpeechRecognizer.ERROR_SERVER -> "Error from server"
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input"
+                    SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "Language not supported"
+                    SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Language unavailable"
                     else -> "Unknown error: $error"
                 }
-                Log.e("VoiceManager", "Speech Recognition Error: $errorMessage")
-                onSpeechStateChanged("IDLE")
+                Log.e("VoiceManager", "STT_ERROR:$errorMessage")
+                
+                if (error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED || error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE) {
+                    onSpeechStateChanged("LANGUAGE_UNSUPPORTED_ON_DEVICE:$currentLanguageCode")
+                } else {
+                    onSpeechStateChanged("IDLE")
+                }
             }
             override fun onResults(results: Bundle?) {
                 val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val finalSpeech = matches?.getOrNull(0)?.trim() ?: ""
-                
-                if (finalSpeech.isEmpty()) {
-                    Log.w("AccessibilityAgent", "Suppressed USER_INTENT dispatch: Empty transcript.")
+                val transcript = matches?.getOrNull(0)
+                Log.d("VoiceManager", "STT_RESULT:$transcript")
+                if (!matches.isNullOrEmpty()) {
+                    val spokenText = matches[0]
+                    onSpeechRecognized(spokenText)
                     onSpeechStateChanged("IDLE")
-                    return
                 }
-                
-                Log.d("VoiceManager", "onResults: $finalSpeech")
-                onSpeechRecognized(finalSpeech)
-                onSpeechStateChanged("IDLE")
             }
             override fun onPartialResults(partialResults: Bundle?) {
                 val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val partialText = matches?.getOrNull(0)
-                Log.d("VoiceManager", "onPartialResults: $partialText")
-                if (!partialText.isNullOrBlank()) {
-                    onPartialResults(partialText)
+                Log.d("VoiceManager", "onPartialResults: ${matches?.getOrNull(0)}")
+                if (!matches.isNullOrEmpty()) {
+                    onPartialResults(matches[0])
                 }
             }
             override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -352,10 +177,8 @@ class VoiceAssistantManager(
 
     // --- Cleanup ---
     fun release() {
-        isRecording = false
         speechRecognizer?.destroy()
         textToSpeech?.stop()
         textToSpeech?.shutdown()
-        mediaPlayer?.release()
     }
 }

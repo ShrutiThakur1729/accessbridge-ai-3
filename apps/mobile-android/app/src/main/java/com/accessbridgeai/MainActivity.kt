@@ -12,10 +12,9 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.text.TextUtils
 import android.util.Log
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.biometric.BiometricPrompt
-import androidx.fragment.app.FragmentActivity
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
@@ -26,18 +25,13 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.accessbridgeai.data.SessionManager
-import com.accessbridgeai.services.AccessibilityAgentService
+import com.accessbridgeai.data.UserProfile
 import com.accessbridgeai.ui.OnboardingViewModel
 import com.accessbridgeai.ui.screens.*
 import com.accessbridgeai.ui.theme.AccessbridgeAIITheme
 import org.json.JSONObject
 
-class MainActivity : FragmentActivity() {
-
-    companion object {
-        private var _instance: MainActivity? = null
-        val instance: MainActivity? get() = _instance
-    }
+class MainActivity : ComponentActivity() {
 
     private lateinit var sessionManager: SessionManager
     private val onboardingViewModel: OnboardingViewModel by viewModels()
@@ -46,7 +40,6 @@ class MainActivity : FragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        _instance = this
         sessionManager = SessionManager(this)
         enableEdgeToEdge()
         
@@ -80,6 +73,19 @@ class MainActivity : FragmentActivity() {
                         LanguageScreen(
                             onLanguageSelected = { lang ->
                                 onboardingViewModel.selectedLanguage = lang
+                                // Immediate update to the running service if active
+                                AccessibilityAgentService.instance?.let { service ->
+                                    service.updateLanguage(lang)
+                                    
+                                    // Provide TTS confirmation of language change
+                                    val confirmation = when (lang) {
+                                        "hi" -> "Óñ¡Óñ¥ÓñÀÓñ¥ Óñ╣Óñ┐ÓñéÓñªÓÑÇ Óñ«ÓÑçÓñé Óñ¼ÓñªÓñ▓ ÓñªÓÑÇ ÓñùÓñê Óñ╣ÓÑê"
+                                        "mr" -> "Óñ¡Óñ¥ÓñÀÓñ¥ Óñ«Óñ░Óñ¥ÓñáÓÑÇÓññ Óñ¼ÓñªÓñ▓Óñ▓ÓÑÇ ÓñåÓñ╣ÓÑç"
+                                        else -> "Language set to English"
+                                    }
+                                    service.speak(confirmation, lang)
+                                }
+                                
                                 navController.navigate("onboarding")
                             }
                         )
@@ -114,6 +120,7 @@ class MainActivity : FragmentActivity() {
                             isConnected = connectionStatus,
                             partialTranscript = partialTranscript,
                             speechState = speechState,
+                            serverUrl = sessionManager.serverUrl,
                             onEnableAccessibility = {
                                 val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                                 startActivity(intent)
@@ -128,9 +135,10 @@ class MainActivity : FragmentActivity() {
                                     permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 }
                             },
-                            onNewGoal = {
-                                AccessibilityAgentService.instance?.handleUserCancel()
-                                Log.d("MainActivity", "New Goal initiated: Session Reset & Hard Stop sent")
+                            onUpdateServerUrl = { newUrl ->
+                                sessionManager.serverUrl = newUrl
+                                // Optional: You might want to restart the service components here
+                                // but the prompt doesn't explicitly ask for it.
                             },
                             onLogout = {
                                 sessionManager.logout()
@@ -152,7 +160,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun isBatteryOptimizationIgnored(context: Context): Boolean {
-        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val pm = context.getSystemService(POWER_SERVICE) as PowerManager
         return pm.isIgnoringBatteryOptimizations(context.packageName)
     }
 
@@ -177,7 +185,7 @@ class MainActivity : FragmentActivity() {
         sendRegistrationToBackend(profile, onboardingViewModel.selectedLanguage)
     }
 
-    private fun sendRegistrationToBackend(profile: com.accessbridgeai.data.UserProfile, language: String) {
+    private fun sendRegistrationToBackend(profile: UserProfile, language: String) {
         val payload = JSONObject().apply {
             put("type", "REGISTRATION")
             put("name", profile.name)
@@ -194,43 +202,6 @@ class MainActivity : FragmentActivity() {
         }
         Log.d("MainActivity", "Registration Payload: $payload")
         AccessibilityAgentService.instance?.sendPayload(payload)
-    }
-
-    override fun onDestroy() {
-        if (_instance == this) _instance = null
-        super.onDestroy()
-    }
-
-    fun showBiometricPrompt(onSuccess: () -> Unit, onError: () -> Unit) {
-        val executor = ContextCompat.getMainExecutor(this)
-        val biometricPrompt = BiometricPrompt(this, executor,
-            object : BiometricPrompt.AuthenticationCallback() {
-                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                    super.onAuthenticationError(errorCode, errString)
-                    Log.e("MainActivity", "Authentication error: $errString")
-                    onError()
-                }
-
-                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                    super.onAuthenticationSucceeded(result)
-                    Log.d("MainActivity", "Authentication succeeded!")
-                    onSuccess()
-                }
-
-                override fun onAuthenticationFailed() {
-                    super.onAuthenticationFailed()
-                    Log.w("MainActivity", "Authentication failed")
-                    onError()
-                }
-            })
-
-        val promptInfo = BiometricPrompt.PromptInfo.Builder()
-            .setTitle("Security Authentication Required")
-            .setSubtitle("Authenticate to proceed")
-            .setNegativeButtonText("Cancel")
-            .build()
-
-        biometricPrompt.authenticate(promptInfo)
     }
 }
 
