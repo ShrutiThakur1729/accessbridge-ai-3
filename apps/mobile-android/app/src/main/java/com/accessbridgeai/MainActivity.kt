@@ -72,6 +72,19 @@ class MainActivity : ComponentActivity() {
                         LanguageScreen(
                             onLanguageSelected = { lang ->
                                 onboardingViewModel.selectedLanguage = lang
+                                // Immediate update to the running service if active
+                                AccessibilityAgentService.instance?.let { service ->
+                                    service.updateLanguage(lang)
+                                    
+                                    // Provide TTS confirmation of language change
+                                    val confirmation = when (lang) {
+                                        "hi" -> "भाषा हिंदी में बदल दी गई है"
+                                        "mr" -> "भाषा मराठीत बदलली आहे"
+                                        else -> "Language set to English"
+                                    }
+                                    service.speak(confirmation, lang)
+                                }
+                                
                                 navController.navigate("onboarding")
                             }
                         )
@@ -106,6 +119,7 @@ class MainActivity : ComponentActivity() {
                             isConnected = connectionStatus,
                             partialTranscript = partialTranscript,
                             speechState = speechState,
+                            serverUrl = sessionManager.serverUrl,
                             onEnableAccessibility = {
                                 val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                                 startActivity(intent)
@@ -119,6 +133,11 @@ class MainActivity : ComponentActivity() {
                                 } else {
                                     permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 }
+                            },
+                            onUpdateServerUrl = { newUrl ->
+                                sessionManager.serverUrl = newUrl
+                                // Optional: You might want to restart the service components here
+                                // but the prompt doesn't explicitly ask for it.
                             },
                             onLogout = {
                                 sessionManager.logout()

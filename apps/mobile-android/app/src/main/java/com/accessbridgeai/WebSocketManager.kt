@@ -76,7 +76,9 @@ class WebSocketManager(
     // Send payload (e.g., user speech transcript or screen context) upstream to Service 01
     fun sendPayload(payload: JSONObject): Boolean {
         if (isConnected && webSocket != null) {
-            return webSocket!!.send(payload.toString())
+            val result = webSocket!!.send(payload.toString())
+            Log.d("AccessibilityAgent", "PAYLOAD_SEND_RESULT:$result")
+            return result
         } else {
             Log.e("WebSocketManager", "Cannot send payload; socket is disconnected.")
             return false

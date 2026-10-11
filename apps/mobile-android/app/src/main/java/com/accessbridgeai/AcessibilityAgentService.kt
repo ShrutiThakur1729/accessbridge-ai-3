@@ -16,6 +16,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.graphics.Rect
 import android.util.Base64
 import android.util.Log
+import com.accessbridgeai.data.SessionManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
@@ -100,8 +101,11 @@ class AccessibilityAgentService : AccessibilityService() {
     }
 
     private fun initializeComponents() {
+        val sessionManager = SessionManager(this)
+        val url = sessionManager.serverUrl
+
         webSocketManager = WebSocketManager(
-            serverUrl = "ws://192.168.29.217:3000",
+            serverUrl = url,
             onMessageReceived = { json -> handleBackendDirective(json) },
             onConnectionStatusChanged = { connected ->
                 Log.d("AccessibilityAgent", "WebSocket connected: $connected")
@@ -129,6 +133,22 @@ class AccessibilityAgentService : AccessibilityService() {
                 _partialTranscript.value = partial
             }
         )
+
+        // Initialize language from session
+        sessionManager.selectedLanguage?.let {
+            voiceAssistantManager?.setLanguage(it)
+        }
+    }
+
+    fun updateLanguage(code: String) {
+        val sessionManager = SessionManager(this)
+        sessionManager.selectedLanguage = code
+        voiceAssistantManager?.setLanguage(code)
+        Log.d("AccessibilityAgent", "Language updated to: $code")
+    }
+
+    fun speak(text: String, languageCode: String? = null) {
+        voiceAssistantManager?.speak(text, languageCode)
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -191,22 +211,31 @@ class AccessibilityAgentService : AccessibilityService() {
         executionAttempts.clear()
         
         serviceScope.launch {
-            val screenState = captureScreenStateWithRetry()
-            val payload = JSONObject().apply {
-                put("type", "USER_INTENT")
-                put("task_id", taskId)
-                put("transcript", transcript)
-                put("timestamp", System.currentTimeMillis())
+            try {
+                val screenState = captureScreenStateWithRetry()
+                val payload = JSONObject().apply {
+                    put("type", "USER_INTENT")
+                    put("task_id", taskId)
+                    put("transcript", transcript)
+                    put("timestamp", System.currentTimeMillis())
+                }
+                attachScreenContext(payload, screenState)
+                Log.d("AccessibilityAgent", "TRANSCRIPT_SENT_TO_BACKEND")
+                Log.d("AccessibilityAgent", "Sending Payload: ${payload.toString(2)}")
+                sendPayload(payload)
+            } catch (e: Exception) {
+                Log.e("AccessibilityAgent", "TRANSCRIPT_SEND_FAILED", e)
             }
-            attachScreenContext(payload, screenState)
-            Log.d("AccessibilityAgent", "Sending Payload: ${payload.toString(2)}")
-            sendPayload(payload)
         }
     }
 
     private fun handleBackendDirective(json: JSONObject) {
         try {
             val speechResponse = json.optString("speech_response")
+            val languageCode = json.optString("language_code")
+            if (languageCode.isNotEmpty()) {
+                Log.d("AccessibilityAgent", "BACKEND_LANGUAGE_CODE:$languageCode")
+            }
             val actionType = json.optString("action_type")
             val targetText = json.optString("target_text")
             val packageName = json.optString("package_name")
@@ -227,7 +256,7 @@ class AccessibilityAgentService : AccessibilityService() {
 
             // 3. Text-to-Speech (TTS) Execution
             if (speechResponse.isNotBlank()) {
-                voiceAssistantManager?.speak(speechResponse)
+                voiceAssistantManager?.speak(speechResponse, if (languageCode.isNullOrBlank()) null else languageCode)
             }
 
             if (actionType == "FINISH" || actionType == "HARD_STOP" || error == "HARD_STOP" || isCompleted) {
@@ -932,6 +961,8 @@ class AccessibilityAgentService : AccessibilityService() {
                     nodesCaptured = currentBatch.length()
                 }
                 activeRoot.recycle()
+            } else if (windowsList.isEmpty()) {
+                Log.w("AccessibilityAgent", "SCREEN_CONTEXT_UNAVAILABLE: Both rootInActiveWindow and windows list are null/empty")
             }
 
             // If active root didn't give us much, or to be thorough, check other windows
@@ -979,9 +1010,13 @@ class AccessibilityAgentService : AccessibilityService() {
     }
 
     private suspend fun attachScreenContext(payload: JSONObject, screenState: JSONObject) {
-        val elements = screenState.optJSONArray("screenElements") ?: JSONArray()
-        payload.put("screen_state", elements)
-        payload.put("screenElements", elements)
+        val elements = screenState.optJSONArray("screenElements")
+        if (elements == null || elements.length() == 0) {
+            Log.w("AccessibilityAgent", "SCREEN_CONTEXT_UNAVAILABLE: No screen elements captured in current state")
+        }
+        val elementsArray = elements ?: JSONArray()
+        payload.put("screen_state", elementsArray)
+        payload.put("screenElements", elementsArray)
         payload.put("current_package_name", screenState.optString("current_package_name"))
         payload.put("current_app_package", screenState.optString("current_package_name"))
         payload.put("active_input_focused", screenState.optBoolean("active_input_focused"))
@@ -989,7 +1024,7 @@ class AccessibilityAgentService : AccessibilityService() {
         if (hint.isNotBlank() && hint != "null") {
             payload.put("focused_hint", hint)
         }
-        if (elements.length() == 0) {
+        if (elementsArray.length() == 0) {
             val screenshot = captureScreenshotBase64()
             if (!screenshot.isNullOrBlank()) {
                 payload.put("screenshot_base64", screenshot)

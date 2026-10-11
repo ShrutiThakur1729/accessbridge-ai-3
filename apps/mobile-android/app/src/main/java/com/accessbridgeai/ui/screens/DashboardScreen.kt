@@ -10,7 +10,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -28,11 +28,16 @@ fun DashboardScreen(
     isConnected: Boolean = false,
     partialTranscript: String = "",
     speechState: String = "IDLE",
+    serverUrl: String = "",
     onEnableAccessibility: () -> Unit,
     onIgnoreBatteryOptimization: () -> Unit = {},
     onMicClick: () -> Unit,
+    onUpdateServerUrl: (String) -> Unit = {},
     onLogout: () -> Unit
 ) {
+    var showServerSettings by remember { mutableStateOf(false) }
+    var tempUrl by remember { mutableStateOf(serverUrl) }
+
     Scaffold(
         topBar = {
             Row(
@@ -230,6 +235,53 @@ fun DashboardScreen(
             )
 
             Spacer(modifier = Modifier.weight(1.5f))
+
+            // Minimal Server Settings
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 16.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { showServerSettings = !showServerSettings }
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        if (showServerSettings) "Hide Server Settings" else "Show Server Settings",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                if (showServerSettings) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = tempUrl,
+                            onValueChange = { tempUrl = it },
+                            label = { Text("Server URL", fontSize = 12.sp) },
+                            modifier = Modifier.weight(1f),
+                            textStyle = MaterialTheme.typography.bodySmall,
+                            singleLine = true,
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = { onUpdateServerUrl(tempUrl) },
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp)
+                        ) {
+                            Text("Save", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
         }
     }
 }

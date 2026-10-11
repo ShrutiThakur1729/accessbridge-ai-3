@@ -12,6 +12,7 @@ class SessionManager(context: Context) {
         private const val KEY_IS_LOGGED_IN = "is_logged_in"
         private const val KEY_USER_PROFILE = "user_profile"
         private const val KEY_SELECTED_LANGUAGE = "selected_language"
+        private const val KEY_SERVER_URL = "server_url"
     }
 
     var isLoggedIn: Boolean
@@ -21,6 +22,10 @@ class SessionManager(context: Context) {
     var selectedLanguage: String?
         get() = prefs.getString(KEY_SELECTED_LANGUAGE, "en")
         set(value) = prefs.edit().putString(KEY_SELECTED_LANGUAGE, value).apply()
+
+    var serverUrl: String
+        get() = prefs.getString(KEY_SERVER_URL, "ws://192.168.29.217:3000") ?: "ws://192.168.29.217:3000"
+        set(value) = prefs.edit().putString(KEY_SERVER_URL, value).apply()
 
     fun saveUserProfile(profile: UserProfile) {
         val json = gson.toJson(profile)
