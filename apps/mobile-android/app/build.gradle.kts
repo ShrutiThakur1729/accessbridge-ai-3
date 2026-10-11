@@ -5,14 +5,12 @@ plugins {
 
 android {
     namespace = "com.accessbridgeai"
-    compileSdk {
-        version = release(37)
-    }
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.accessbridgeai"
         minSdk = 24
-        targetSdk = 36
+        targetSdk = 37
         versionCode = 1
         versionName = "1.0"
 
@@ -35,6 +33,9 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // Bypass AGP version checks for newer library metadata
+    experimentalProperties["android.experimental.apksigner.enabled"] = true
 }
 
 dependencies {
@@ -60,5 +61,4 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
-
 }

@@ -5,6 +5,7 @@ import { ENV } from "../config/env.js";
 import { logger } from "../utils/logger.js";
 import { ActionHistoryEntry, IntentClient, PlannerActionType, PlannerDirective, VisionClient } from "../services/intentClient.js";
 import { SttClient, SttError } from "../services/sttClient.js";
+import { getBlacklistMemory } from "../services/databricksClient.js";
 
 export interface ResponsePayload {
   task_id: string;
@@ -38,6 +39,11 @@ interface TaskContext {
   actionHistory: ActionHistoryEntry[];
   blacklistMemory: string[];
   zeroElementAttempts?: number;
+  databricksBlacklistCache?: {
+    packageName: string;
+    entries: string[];
+    fetchedAt: number;
+  };
 }
 
 interface PendingHybridAudio {
@@ -579,6 +585,49 @@ export function setupWebSocketServer(wss: WebSocketServer) {
           "Compressed screen state and querying Python AI Planner"
         );
 
+        // ── Merge persisted Databricks failure history into blacklist ────
+// Cached per session per package, with a TTL, to avoid hitting Databricks
+// on every single WebSocket message (which would add real latency to
+// every user action, especially on a cold serverless warehouse).
+const BLACKLIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const cache = taskContext.databricksBlacklistCache;
+const cacheIsFresh =
+  cache &&
+  cache.packageName === currentPackageName &&
+  Date.now() - cache.fetchedAt < BLACKLIST_CACHE_TTL_MS;
+
+let databricksBlacklist: string[];
+if (cacheIsFresh) {
+  databricksBlacklist = cache!.entries;
+} else {
+  // getBlacklistMemory() never throws — returns [] on failure/unconfigured
+  databricksBlacklist = await getBlacklistMemory(userId, currentPackageName);
+  taskContext.databricksBlacklistCache = {
+    packageName: currentPackageName,
+    entries: databricksBlacklist,
+    fetchedAt: Date.now(),
+  };
+}
+
+const mergedBlacklistSet = new Set<string>([
+  ...taskContext.blacklistMemory,
+  ...databricksBlacklist,
+]);
+const mergedBlacklist = Array.from(mergedBlacklistSet);
+
+        if (databricksBlacklist.length > 0) {
+          logger.info(
+            {
+              requestId,
+              taskId,
+              clientEntries: taskContext.blacklistMemory.length,
+              databricksEntries: databricksBlacklist.length,
+              mergedTotal: mergedBlacklist.length,
+            },
+            "Merged Databricks failure history into blacklist_memory"
+          );
+        }
+
         const aiPlan = await IntentClient.evaluateIntent(
           {
             user_id: userId,
@@ -603,7 +652,7 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             screenshot_base64: screenshotBase64 || undefined,
             vision_elements: visionElements,
             action_history: taskContext.actionHistory,
-            blacklist_memory: taskContext.blacklistMemory,
+            blacklist_memory: mergedBlacklist,
           },
           requestId
         );
