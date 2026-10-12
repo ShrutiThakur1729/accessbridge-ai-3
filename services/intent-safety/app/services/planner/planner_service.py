@@ -145,6 +145,15 @@ class PlannerService:
             session_ctx.active_package = current_app_package
 
         affirmative_regex = r"\b(?:yes|sure|install|open|ok|okay|yeah|yep|do it|please|go ahead)\b"
+        
+        is_fresh_utterance = str(action_status).upper() == "INITIAL"
+        print(f"[planner] status={action_status} fresh={is_fresh_utterance} "
+            f"pending_install={self._pending_install_intents.get(session_key)!r} "
+            f"drawer_state={self._session_states.get(session_key)!r}")
+
+        pending_ambiguous_app = self._pending_app_confirmations.get(session_key) if is_fresh_utterance else None
+
+        pending_install_app = self._pending_install_intents.get(session_key) if is_fresh_utterance else None
 
         def attach_session_metadata(plan: ActionPlanResponse) -> ActionPlanResponse:
             """Ensure session_id and updated conversation history are attached to response."""
@@ -160,7 +169,7 @@ class PlannerService:
         # =========================================================================
         
         # 0A. Pending Ambiguous App Confirmation Flow
-        pending_ambiguous_app = self._pending_app_confirmations.get(session_key)
+        
         if pending_ambiguous_app:
             if re.search(affirmative_regex, user_prompt, re.IGNORECASE):
                 candidate_app = self._pending_app_confirmations.pop(session_key, None) or pending_ambiguous_app
@@ -201,7 +210,7 @@ class PlannerService:
                 ))
 
         # 0B. Pending Play Store Install Confirmation Flow
-        pending_install_app = self._pending_install_intents.get(session_key)
+        
         if pending_install_app:
             if re.search(affirmative_regex, user_prompt, re.IGNORECASE):
                 app_name = self._pending_install_intents.pop(session_key, None) or pending_install_app
@@ -352,7 +361,7 @@ class PlannerService:
                 for step in plan.steps:
                     if step.action == ActionType.OPEN_APP:
                         editable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_editable(n)), None)
-                        clickable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_clickable(n)), None)
+                        clickable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_clickable(n) and node_target_label(n)), None)
                         if editable_node:
                             lbl = node_target_label(editable_node) or "input"
                             clean_payload = extract_clean_entity(user_prompt) or user_prompt
@@ -619,7 +628,7 @@ class PlannerService:
         # Fallback Plan Generation
         if is_app_foreground(current_app_package, user_prompt):
             editable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_editable(n)), None)
-            clickable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_clickable(n)), None)
+            clickable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_clickable(n) and node_target_label(n)), None)
             if editable_node:
                 lbl = node_target_label(editable_node) or "input"
                 clean_payload = extract_clean_entity(user_prompt) or user_prompt

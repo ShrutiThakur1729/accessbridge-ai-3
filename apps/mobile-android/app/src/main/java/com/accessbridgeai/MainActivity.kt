@@ -220,7 +220,7 @@ class MainActivity : FragmentActivity() {
                 override fun onAuthenticationFailed() {
                     super.onAuthenticationFailed()
                     Log.w("MainActivity", "Authentication failed")
-                    onError()
+                    
                 }
             })
 

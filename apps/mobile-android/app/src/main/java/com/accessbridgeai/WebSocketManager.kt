@@ -107,7 +107,7 @@ class WebSocketManager(
     }
 
     // Send payload (e.g., user speech transcript or screen context) upstream to Service 01
-    fun sendPayload(payload: JSONObject, purgeQueue: Boolean = false): Boolean {
+    fun sendPayload(payload: JSONObject, purgeQueue: Boolean = false, queueIfOffline: Boolean = true): Boolean {
         if (purgeQueue) {
             purgePendingPayloads()
         }
@@ -136,6 +136,10 @@ class WebSocketManager(
 
             // GUARD: If not connected, queue and trigger reconnect
             if (webSocket == null || !isConnected) {
+                if (!queueIfOffline) {
+                    Log.w("WebSocketManager", "Offline; not queuing ${payload.optString("type")}")
+                    return false
+                }
                 Log.w("WebSocketManager", "Socket disconnected. Queuing payload: ${payload.optString("type")}")
                 synchronized(pendingPayloads) {
                     if (pendingPayloads.size < 50) { // Safety limit for memory
@@ -148,18 +152,26 @@ class WebSocketManager(
 
             val success = webSocket?.send(payload.toString()) ?: false
             if (!success) {
-                Log.e("WebSocketManager", "Failed to send payload through socket. Queuing for retry.")
-                synchronized(pendingPayloads) {
-                    pendingPayloads.add(payload)
+                if (queueIfOffline) {
+                    Log.e("WebSocketManager", "Failed to send payload through socket. Queuing for retry.")
+                    synchronized(pendingPayloads) {
+                        pendingPayloads.add(payload)
+                    }
+                } else {
+                    Log.e("WebSocketManager", "Failed to send ${payload.optString("type")}; not queuing")
                 }
             } else {
                 Log.d("WebSocketManager", "Payload sent successfully: ${payload.optString("type")}")
             }
             return success
         } catch (e: Exception) {
-            Log.e("WebSocketManager", "Send error caught: ${e.message}. Payload queued for auto-retry.")
-            synchronized(pendingPayloads) {
-                pendingPayloads.add(payload)
+            if (queueIfOffline) {
+                Log.e("WebSocketManager", "Send error caught: ${e.message}. Payload queued for auto-retry.")
+                synchronized(pendingPayloads) {
+                    pendingPayloads.add(payload)
+                }
+            } else {
+                Log.e("WebSocketManager", "Send error for ${payload.optString("type")}: ${e.message}; not queuing")
             }
             isConnected = false
             return false

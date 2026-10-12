@@ -17,6 +17,8 @@ import com.accessbridgeai.utils.ExecutionEngine
 import com.accessbridgeai.MainActivity
 import com.accessbridgeai.WebSocketManager
 import com.accessbridgeai.VoiceAssistantManager
+import com.accessbridgeai.utils.AgentLoop
+import com.accessbridgeai.utils.AgentTask
 import com.accessbridgeai.utils.LauncherAppResolver
 import com.accessbridgeai.utils.LoopDetector
 import com.accessbridgeai.data.SessionManager
@@ -26,6 +28,18 @@ import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
+import android.content.ComponentName
+import android.os.UserHandle
+import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import com.accessbridgeai.screen.ScreenReader
+import com.accessbridgeai.screen.DumpJson
+import com.accessbridgeai.screen.DumpFile
+import com.accessbridgeai.screen.DumpMeta
+import com.accessbridgeai.agent.Ids
+import com.accessbridgeai.agent.OpenEntry
+import com.accessbridgeai.device.AndroidDevice
 
 class AccessibilityAgentService : AccessibilityService() {
 
@@ -35,6 +49,8 @@ class AccessibilityAgentService : AccessibilityService() {
 
         private val _serviceInstance = MutableStateFlow<AccessibilityAgentService?>(null)
         val serviceInstance: StateFlow<AccessibilityAgentService?> = _serviceInstance
+        private val IN_APP_PLANNING_ENABLED = false   // flip to true when the in-app planner exists
+        const val AGENT_LOOP_ENABLED = true
     }
 
     var webSocketManager: WebSocketManager? = null
@@ -51,7 +67,16 @@ class AccessibilityAgentService : AccessibilityService() {
     private var currentTaskId: String? = null
     private var currentOriginalIntent: String? = null
     private val executionAttempts = mutableMapOf<String, Int>()
+    private val pendingServerRequests = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
 
+    private class PendingQuestion(
+        val question: String,
+        val expiresAtMs: Long,
+        val onYes: () -> Unit,
+        val onNo: () -> Unit
+    )
+    @Volatile private var pendingQuestion: PendingQuestion? = null
+    private val QUESTION_TTL_MS = 60_000L
     private val _connectionStatus = MutableStateFlow(false)
     val connectionStatus: StateFlow<Boolean> = _connectionStatus
 
@@ -75,6 +100,7 @@ class AccessibilityAgentService : AccessibilityService() {
         instance = this
         _serviceInstance.value = this
         Log.d("AccessibilityAgent", "Service Connected")
+        Log.d("AccessibilityAgent", "BUILD=d3-live-1")
 
         sessionManager = SessionManager(this)
 
@@ -87,7 +113,9 @@ class AccessibilityAgentService : AccessibilityService() {
             serverUrl = "ws://192.168.29.217:3000/ws/agent", // Placeholder, should be configurable
             sessionManager = sessionManager,
             onMessageReceived = { json ->
-                handleBackendDirective(json)
+                val type = json.optString("message_type")
+                if (type == "APP_EXTRACTED" || type == "REPLY_CLASSIFIED") handleServerReply(json)
+                else handleBackendDirective(json)
             },
             onConnectionStatusChanged = { isConnected ->
                 _connectionStatus.value = isConnected
@@ -107,6 +135,78 @@ class AccessibilityAgentService : AccessibilityService() {
                 _speechState.value = state
             }
         )
+    }
+
+        private fun handleServerReply(json: JSONObject) {
+        val requestId = json.optString("request_id")
+        val waiting = pendingServerRequests[requestId]
+        if (waiting == null) {
+            Log.w("AccessibilityAgent", "Ignoring late or unknown APP_EXTRACTED reply: $requestId")
+            return
+        }
+        waiting.complete(json)
+    }
+
+    private suspend fun askServer(messageType: String, fields: Map<String, String>, timeoutMs: Long = 40_000L): JSONObject? {
+        val requestId = UUID.randomUUID().toString()
+        val reply = CompletableDeferred<JSONObject>()
+        pendingServerRequests[requestId] = reply
+        try {
+            val payload = JSONObject().apply {
+                put("type", messageType)
+                put("message_type", messageType)
+                put("request_id", requestId)
+                fields.forEach { (key, value) -> put(key, value) }
+            }
+            val sent = webSocketManager?.sendPayload(payload, queueIfOffline = false) ?: false
+            if (!sent) return null
+            return withTimeoutOrNull(timeoutMs) { reply.await() }
+        } finally {
+            pendingServerRequests.remove(requestId)
+        }
+    }
+
+    private suspend fun requestAppExtraction(transcript: String): JSONObject? =
+        askServer("EXTRACT_APP", mapOf("transcript" to transcript))
+
+    private suspend fun requestReplyClassification(question: String, reply: String): JSONObject? =
+        askServer("CLASSIFY_REPLY", mapOf("question" to question, "reply" to reply))
+
+    private fun launchFromExtraction(label: String, componentName: ComponentName, userHandle: UserHandle, task: AgentTask) {
+        val launched = try {
+            val launcherApps = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
+            launcherApps.startMainActivity(componentName, userHandle, null, null)
+            true
+        } catch (e: Exception) {
+            Log.e("AccessibilityAgent", "Launch failed for $label", e)
+            false
+        }
+        if (launched) {
+            Log.d("AccessibilityAgent", "Launched $label via extraction; task: '$task'")
+            if (AGENT_LOOP_ENABLED && task.raw.isNotBlank()) {
+                agentLoop.start(task, componentName.packageName)
+            } else {
+                voiceAssistantManager?.speak(
+                    if (task.raw.isBlank()) "Opening $label" else "Opened $label. I can't do the rest of that yet."
+                )
+            }
+        } else {
+            voiceAssistantManager?.speak("I found $label but couldn't open it.")
+        }
+        currentTaskId = null
+        currentOriginalIntent = null
+    }
+
+    private fun askUser(question: String, onYes: () -> Unit, onNo: () -> Unit = {}) {
+        val pending = PendingQuestion(question, System.currentTimeMillis() + QUESTION_TTL_MS, onYes, onNo)
+        pendingQuestion = pending
+        voiceAssistantManager?.speak(question) {
+            // Open the mic only after the question has been spoken, and only if it is still the current one
+            if (pendingQuestion === pending) {
+                voiceAssistantManager?.playChime()
+                voiceAssistantManager?.startListening()
+            }
+        }
     }
 
     @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.O)
@@ -155,6 +255,7 @@ class AccessibilityAgentService : AccessibilityService() {
         }
         sendPayload(payload)
         performTakeOverCleanup()
+        agentLoop.cancel()
     }
 
     /**
@@ -163,11 +264,13 @@ class AccessibilityAgentService : AccessibilityService() {
      */
     fun performTakeOverCleanup() {
         Log.d("AccessibilityAgent", "Performing Takeover/Cleanup: Resetting session.")
+        agentLoop.cancel()
         voiceAssistantManager?.stopAllOperations()
         activeDirectiveJob?.cancel()
         currentTaskId = null
         currentOriginalIntent = null
         executionAttempts.clear()
+        pendingQuestion = null
         LoopDetector.clearHistory()
         currentSessionId = null
         sessionResetJob?.cancel()
@@ -239,6 +342,7 @@ class AccessibilityAgentService : AccessibilityService() {
     }
 
     fun sendUserIntent(intent: String) {
+
         val cleanIntent = intent.trim()
         if (cleanIntent.isEmpty()) {
             Log.w("AccessibilityAgent", "Suppressed USER_INTENT dispatch: Empty transcript.")
@@ -250,46 +354,140 @@ class AccessibilityAgentService : AccessibilityService() {
         executionAttempts.clear()
         LoopDetector.clearHistory()
 
+
+
         serviceScope.launch {
+            val t = intent.lowercase()
+            Log.d("AgentTest", "heard t='$t'")
+            if ("dump" in t || "dumb" in t) { dumpScreen(); return@launch }
+            if ("test biometric" in t) { val ok = confirmWithBiometric(); returnToApp(packageName); voiceAssistantManager?.speak(if (ok) "Fingerprint accepted" else "Fingerprint failed"); return@launch }
+            Regex("^agent (type|search) (.+)$").find(t.trim())?.let { m ->
+                runAgentTest(m.groupValues[2], submit = m.groupValues[1] == "search"); return@launch
+            }
+            if (agentLoop.onUserReply(cleanIntent)) return@launch
+            Log.d("DUMP", "heard: '$intent'")
+            if (intent.trim().equals("dump screen", ignoreCase = true)) { dumpScreen(); return@launch }
+            val pending = pendingQuestion
+            if (pending != null) {
+                pendingQuestion = null   // take the note down BEFORE asking the AI: it can only be used once
+                if (System.currentTimeMillis() <= pending.expiresAtMs) {
+                    voiceAssistantManager?.speak("One moment")
+                    val result = requestReplyClassification(pending.question, cleanIntent)
+                    if (result == null || !result.optBoolean("ok", false)) {
+                        Log.w("AccessibilityAgent", "Reply classification failed: ${result?.optString("reason") ?: "no reply"}")
+                        voiceAssistantManager?.speak("Sorry, I didn't catch that. Please try again.")
+                        return@launch
+                    }
+                    when (result.optString("answer")) {
+                        "YES" -> { pending.onYes(); return@launch }
+                        "NO" -> { pending.onNo(); return@launch }
+                        // OTHER: the user said something new. Fall through and handle it as a normal command.
+                    }
+                } else {
+                    Log.d("AccessibilityAgent", "Pending question expired; treating input as a new command")
+                }
+            }
             val gatingResult = LauncherAppResolver.evaluateLaunchIntent(this@AccessibilityAgentService, cleanIntent)
-            
+
             when (gatingResult) {
                 is LauncherAppResolver.LaunchGatingResult.SIMPLE_LAUNCH -> {
                     voiceAssistantManager?.speak("Opening ${gatingResult.appLabel}")
                     val launcherApps = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
                     try {
                         launcherApps.startMainActivity(gatingResult.componentName, gatingResult.userHandle, null, null)
-                        
-                        delay(1200) // Settlement delay
-                        sendFeedbackAfterAction(
-                            result = ActionResult(true, "SUCCESS"),
-                            actionType = "OPEN_APP",
-                            targetPackage = gatingResult.packageName,
-                            intent = cleanIntent,
-                            isCompleted = true
-                        )
+
+                        Log.d("AccessibilityAgent", "Local launch of ${gatingResult.appLabel} done; task finished on-device")
+                        currentTaskId = null
+                        currentOriginalIntent = null
                         return@launch
                     } catch (e: Exception) {
                         Log.e("AccessibilityAgent", "Local launch failed for ${gatingResult.appLabel}", e)
                     }
                 }
                 is LauncherAppResolver.LaunchGatingResult.AMBIGUOUS_LAUNCH -> {
-                    val candidateLabels = gatingResult.candidates.map { 
-                        "${it.label}${if (it.isManaged) " (Work)" else ""}" 
+                    val candidateLabels = gatingResult.candidates.map {
+                        "${it.label}${if (it.isManaged) " (Work)" else ""}"
                     }
                     val speech = "I found multiple matching apps: ${candidateLabels.joinToString(" and ")}. Which one did you mean?"
                     voiceAssistantManager?.speak(speech)
-                    
-                    sendFeedbackAfterAction(
-                        result = ActionResult(false, "AMBIGUOUS_MATCH", candidates = candidateLabels),
-                        actionType = "OPEN_APP",
-                        intent = cleanIntent
+                    return@launch
+                }
+                is LauncherAppResolver.LaunchGatingResult.COMPLEX_INTENT -> {
+                    val launcherApps = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
+                    try {
+                        launcherApps.startMainActivity(gatingResult.componentName, gatingResult.userHandle, null, null)
+                        Log.d("AccessibilityAgent", "Launched ${gatingResult.appLabel}; task: '${gatingResult.leftoverText}'")
+                        if (AGENT_LOOP_ENABLED && gatingResult.leftoverText.isNotBlank()) {
+                            agentLoop.start(AgentTask.legacy(gatingResult.leftoverText),gatingResult.componentName.packageName)
+                        } else {
+                            voiceAssistantManager?.speak("Opened ${gatingResult.appLabel}. I can't do the rest of that yet.")
+                        }
+                        currentTaskId = null
+                        currentOriginalIntent = null
+                        return@launch
+                    } catch (e: Exception) {
+                        Log.e("AccessibilityAgent", "Local launch failed for ${gatingResult.appLabel}", e)
+                    }
+                }
+                is LauncherAppResolver.LaunchGatingResult.SUGGEST_LAUNCH -> {
+                    val c = gatingResult.candidate
+                    askUser(
+                        question = "Did you mean ${c.label}?",
+                        onYes = {
+                            val launcherApps = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
+                            launcherApps.startMainActivity(c.componentName, c.userHandle, null, null)
+                        }
                     )
                     return@launch
                 }
                 else -> {
-                    // Bypass local execution for COMPLEX_INTENT or NO_LOCAL_MATCH
-                    Log.d("AccessibilityAgent", "Intent bypassed local gating: $cleanIntent")
+                    Log.d("AccessibilityAgent", "Local gate missed; asking extraction service: $cleanIntent")
+                    voiceAssistantManager?.speak("One moment")
+                    val extraction = requestAppExtraction(cleanIntent)
+
+                    if (extraction == null || !extraction.optBoolean("ok", false)) {
+                        Log.w("AccessibilityAgent", "Extraction failed: ${extraction?.optString("reason") ?: "no reply (offline or timeout)"}")
+                        voiceAssistantManager?.speak("Sorry, I couldn't work out which app you meant. Please try again.")
+                        return@launch
+                    }
+
+                    // JSON null becomes the text "null" with optString, so check isNull first
+                    val appName: String? =
+                        if (extraction.isNull("app_name")) null
+                        else extraction.optString("app_name").trim().ifEmpty { null }
+
+                    if (appName != null) {
+                        val task = AgentTask.from(extraction)
+                        val match = LauncherAppResolver.evaluateLaunchIntent(this@AccessibilityAgentService, appName, allowSuggestions = true)
+                        when (match) {
+                            is LauncherAppResolver.LaunchGatingResult.SIMPLE_LAUNCH ->
+                                launchFromExtraction(match.appLabel, match.componentName, match.userHandle, task)
+                            is LauncherAppResolver.LaunchGatingResult.COMPLEX_INTENT ->
+                                launchFromExtraction(match.appLabel, match.componentName, match.userHandle, task)
+                            is LauncherAppResolver.LaunchGatingResult.SUGGEST_LAUNCH -> {
+                                val c = match.candidate
+                                askUser(
+                                    question = "I couldn't find $appName. Did you mean ${c.label}?",
+                                    onYes = { launchFromExtraction(c.label, c.componentName, c.userHandle, task) },
+                                    onNo = { voiceAssistantManager?.speak("Okay.") }
+                                )
+                            }
+                            is LauncherAppResolver.LaunchGatingResult.AMBIGUOUS_LAUNCH ->
+                                voiceAssistantManager?.speak(
+                                    "I found several apps: ${match.candidates.joinToString(" and ") { it.label }}. Please say the exact name."
+                                )
+                            else ->
+                                voiceAssistantManager?.speak("I couldn't find an app called $appName.")
+                        }
+                        return@launch
+                    }
+
+                    if (!IN_APP_PLANNING_ENABLED) {
+                        Log.d("AccessibilityAgent", "No app named and in-app planning is off; not calling /plan: '$cleanIntent'")
+                        voiceAssistantManager?.speak("I couldn't tell which app you meant. Try saying the app name, like open Ola.")
+                        return@launch
+                    }
+                    Log.d("AccessibilityAgent", "No app named; continuing with in-app planning")
                 }
             }
 
@@ -874,5 +1072,87 @@ class AccessibilityAgentService : AccessibilityService() {
         payload.put("current_package_name", screenState.optString("packageName"))
         payload.put("screenElements", screenState.optJSONArray("screenElements"))
         payload.put("dom_hash", LoopDetector.calculateDomHash(screenState.optJSONArray("screenElements") ?: JSONArray()))
+    }
+
+    /** TEMPORARY Phase D test hook: runs OPEN_ENTRY on whatever app is in front. Remove at D6. */
+    private suspend fun runAgentTest(query: String, submit: Boolean) {
+        try {
+            val pkg = rootInActiveWindow?.packageName?.toString()
+            if (pkg == null || pkg == packageName) {
+                voiceAssistantManager?.speak("Open the app you want to test first.")
+                return
+            }
+            val m = resources.displayMetrics
+            val device = AndroidDevice(pkg, { rootInActiveWindow }, { m.widthPixels to m.heightPixels }, { x, y -> tapAtCoordinates(x, y) })
+            val ids = Ids("${sessionManager.getSessionId()}", UUID.randomUUID().toString(), 1)
+            val result = OpenEntry(device).run(ids, query, submit)
+            result.decisions.forEach { Log.d("AgentTest", "${it.role} ${it.rung} chosen=${it.chosen?.nodeId} ${it.reason}") }
+            Log.d("AgentTest", "status=${result.status} say=${result.say}")
+            voiceAssistantManager?.speak(result.say ?: if (submit) "Searched for $query." else "Typed $query.")
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("AgentTest", "agent test crashed", e)
+            voiceAssistantManager?.speak("The test crashed. Check the log.")
+        }
+    }
+
+    private fun dumpScreen() {
+        try {
+            val root = rootInActiveWindow ?: run { Log.w("DUMP", "no root window"); return }
+            val m = resources.displayMetrics
+            val screen = ScreenReader.read(root, m.widthPixels, m.heightPixels)
+            val pkg = root.packageName?.toString() ?: "unknown"
+
+            screen.nodes
+                .filter { it.clickable || it.editable || it.scrollable || it.text.isNotBlank() || it.desc.isNotBlank() }
+                .forEach { Log.d("DUMP", it.summary()) }
+
+            val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+            val file = java.io.File(getExternalFilesDir("dumps") ?: filesDir, "${pkg}_$stamp.json")
+            file.writeText(DumpJson.write(DumpFile(DumpMeta(DumpJson.FORMAT_VERSION, pkg, System.currentTimeMillis()), screen)))
+            Log.d("DUMP", "pkg=$pkg nodes=${screen.nodes.size} saved=${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e("DUMP", "dump failed", e)
+        }
+    }
+
+    private val agentLoop by lazy {
+        AgentLoop(
+            scope = serviceScope,
+            getRoot = { rootInActiveWindow },
+            speak = { t, cb -> if (cb == null) voiceAssistantManager?.speak(t) else voiceAssistantManager?.speak(t) { cb() } },
+            openMic = { voiceAssistantManager?.playChime(); voiceAssistantManager?.startListening() },
+            tapXY = { x, y -> tapAtCoordinates(x, y) },
+            classify = { q, r -> requestReplyClassification(q, r)?.optString("answer") ?: "OTHER" },
+            biometric = { confirmWithBiometric() },
+            returnToApp = { pkg -> returnToApp(pkg) }
+        )
+    }
+
+    private suspend fun confirmWithBiometric(): Boolean {
+        val la = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
+        try {
+            la.startMainActivity(ComponentName(packageName, "com.accessbridgeai.MainActivity"),
+                android.os.Process.myUserHandle(), null, null)
+        } catch (e: Exception) { Log.e("AccessibilityAgent", "Cannot bring app forward", e); return false }
+        var tries = 0
+        while (MainActivity.instance == null && tries < 20) { delay(200); tries++ }
+        val activity = MainActivity.instance ?: return false
+        delay(600)   // let the activity reach RESUMED before BiometricPrompt
+        return suspendCancellableCoroutine { cont ->
+            activity.showBiometricPrompt(
+                onSuccess = { if (cont.isActive) cont.resume(true) },
+                onError = { if (cont.isActive) cont.resume(false) }
+            )
+        }
+    }
+
+    private fun returnToApp(pkg: String) {
+        try {
+            val la = getSystemService(LAUNCHER_APPS_SERVICE) as LauncherApps
+            val h = android.os.Process.myUserHandle()
+            la.getActivityList(pkg, h).firstOrNull()?.let { la.startMainActivity(it.componentName, h, null, null) }
+        } catch (e: Exception) { Log.e("AccessibilityAgent", "returnToApp failed", e) }
     }
 }
