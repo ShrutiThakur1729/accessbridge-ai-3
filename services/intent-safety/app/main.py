@@ -3,6 +3,10 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from app.services.app_extractor import ExtractResult, extract_app
+import asyncio
+from app.services.reply_classifier import ClassifyResult, classify_reply
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,7 +75,10 @@ def dispatch_plan(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load the model in the background so the first real request isn't ~20 s slow
+    app.state.warmup = asyncio.create_task(extract_app("open camera"))
     yield
+    
 
 
 app = FastAPI(
@@ -108,6 +115,8 @@ async def health_check():
     summary="Generate Execution Plan from User Prompt",
     description="Evaluates user intent safety risk level and creates structured UI navigation steps."
 )
+
+
 async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
     user_prompt = request.user_prompt or "Continue task"
     user_id = request.user_id or "default_user"
@@ -162,3 +171,21 @@ async def generate_plan(request: PlannerRequest) -> ActionPlanResponse:
     )
 
     return dispatch_plan(plan, user_prompt, session_id, session_language, request.message_type)
+
+class ClassifyRequest(BaseModel):
+    question: str
+    reply: str
+
+
+@app.post(f"{settings.API_PREFIX}/classify-reply", response_model=ClassifyResult, tags=["Reply Classification"])
+async def classify_reply_endpoint(request: ClassifyRequest) -> ClassifyResult:
+    return await classify_reply(request.question, request.reply)
+
+class ExtractRequest(BaseModel):
+    transcript: str
+
+
+@app.post(f"{settings.API_PREFIX}/extract-app", response_model=ExtractResult, tags=["App Extraction"])
+async def extract_app_endpoint(request: ExtractRequest) -> ExtractResult:
+    return await extract_app(request.transcript)
+

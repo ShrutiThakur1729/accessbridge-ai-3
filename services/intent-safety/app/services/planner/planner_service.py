@@ -159,6 +159,15 @@ class PlannerService:
             session_ctx.active_package = current_app_package
 
         affirmative_regex = r"\b(?:yes|sure|install|open|ok|okay|yeah|yep|do it|please|go ahead)\b"
+        
+        is_fresh_utterance = str(action_status).upper() == "INITIAL"
+        print(f"[planner] status={action_status} fresh={is_fresh_utterance} "
+            f"pending_install={self._pending_install_intents.get(session_key)!r} "
+            f"drawer_state={self._session_states.get(session_key)!r}")
+
+        pending_ambiguous_app = self._pending_app_confirmations.get(session_key) if is_fresh_utterance else None
+
+        pending_install_app = self._pending_install_intents.get(session_key) if is_fresh_utterance else None
 
         def attach_session_metadata(plan: ActionPlanResponse, path_name: str) -> ActionPlanResponse:
             effective_response_lang = plan.response_language or resolved_lang
@@ -172,7 +181,7 @@ class PlannerService:
             })
 
         # 0A. Pending Ambiguous App Confirmation Flow
-        pending_ambiguous_app = self._pending_app_confirmations.get(session_key)
+        
         if pending_ambiguous_app:
             if re.search(affirmative_regex, user_prompt, re.IGNORECASE):
                 candidate_app = self._pending_app_confirmations.pop(session_key, None) or pending_ambiguous_app
@@ -215,7 +224,7 @@ class PlannerService:
                 ), "guard_ambiguous_app_cancel")
 
         # 0B. Pending Play Store Install Confirmation Flow
-        pending_install_app = self._pending_install_intents.get(session_key)
+        
         if pending_install_app:
             if re.search(affirmative_regex, user_prompt, re.IGNORECASE):
                 app_name = self._pending_install_intents.pop(session_key, None) or pending_install_app
@@ -399,9 +408,31 @@ class PlannerService:
             if is_app_foreground(current_app_package, user_prompt):
                 sanitized_steps = []
                 for step in plan.steps:
-                    if step.action == ActionType.OPEN_APP and not step.input_data:
-                        if len(plan.steps) > 1:
-                            continue
+                    if step.action == ActionType.OPEN_APP:
+                        editable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_editable(n)), None)
+                        clickable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_clickable(n) and node_target_label(n)), None)
+                        if editable_node:
+                            lbl = node_target_label(editable_node) or "input"
+                            clean_payload = extract_clean_entity(user_prompt) or user_prompt
+                            sanitized_steps.append(PlanStep(
+                                step_id=step.step_id,
+                                action=ActionType.TYPE_TEXT,
+                                target_node=lbl,
+                                target_text=lbl,
+                                input_data=clean_payload,
+                                tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                                reason="Hard Package Lock: converted OPEN_APP to in-app TYPE_TEXT for foreground app.",
+                            ))
+                        elif clickable_node:
+                            lbl = node_target_label(clickable_node)
+                            sanitized_steps.append(PlanStep(
+                                step_id=step.step_id,
+                                action=ActionType.CLICK,
+                                target_node=lbl,
+                                target_text=lbl,
+                                tier=WaterfallTier.TIER_3_ACCESSIBILITY,
+                                reason="Hard Package Lock: converted OPEN_APP to in-app CLICK for foreground app.",
+                            ))
                         else:
                             sanitized_steps.append(PlanStep(
                                 step_id=step.step_id,
@@ -710,7 +741,7 @@ class PlannerService:
         # Fallback Plan Generation (if LLM is disabled or unavailable)
         if is_app_foreground(current_app_package, user_prompt):
             editable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_editable(n)), None)
-            clickable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_clickable(n)), None)
+            clickable_node = next((n for n in screen_state if isinstance(n, dict) and node_is_clickable(n) and node_target_label(n)), None)
             if editable_node:
                 lbl = node_target_label(editable_node) or "input"
                 clean_payload = extract_clean_entity(user_prompt) or user_prompt

@@ -44,6 +44,8 @@ interface TaskContext {
     entries: string[];
     fetchedAt: number;
   };
+  consecutiveFailures?: number;
+  turnCount?: number;
 }
 
 interface PendingHybridAudio {
@@ -276,6 +278,37 @@ export function setupWebSocketServer(wss: WebSocketServer) {
         }
 
         let parsedMessage: Record<string, any> = JSON.parse(message.toString());
+                // --- App extraction: a quick question to the AI, handled before any planner logic ---
+        if (String(parsedMessage.message_type || parsedMessage.type || "").toUpperCase() === "EXTRACT_APP") {
+          const extraction = await IntentClient.extractApp(String(parsedMessage.transcript || ""), requestId);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              message_type: "APP_EXTRACTED",
+              request_id: parsedMessage.request_id || "",
+              ...extraction,
+            }));
+          }
+          logger.info({ requestId, ok: extraction.ok, app_name: extraction.app_name }, "App extraction relayed");
+          return;
+        }
+
+        if (String(parsedMessage.message_type || parsedMessage.type || "").toUpperCase() === "CLASSIFY_REPLY") {
+          const classification = await IntentClient.classifyReply(
+            String(parsedMessage.question || ""),
+            String(parsedMessage.reply || ""),
+            requestId
+          );
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              message_type: "REPLY_CLASSIFIED",
+              request_id: parsedMessage.request_id || "",
+              ...classification,
+            }));
+          }
+          logger.info({ requestId, ok: classification.ok, answer: classification.answer }, "Reply classification relayed");
+          return;
+        }
+        
         let audioBuffer: Buffer | undefined;
         let hybridPayload = false;
 
@@ -434,6 +467,28 @@ export function setupWebSocketServer(wss: WebSocketServer) {
             package_name: parsedMessage.package_name || parsedMessage.target_package || undefined,
             status: actionStatus.toUpperCase(),
           });
+        }
+
+                // --- Circuit breaker: stop runaway tasks ---
+        const statusUpper = actionStatus.toUpperCase();
+        const failures = (statusUpper === "FAILED" || statusUpper === "LOOP_DETECTED")
+          ? (taskContext.consecutiveFailures ?? 0) + 1 : 0;
+        const turns = statusUpper === "INITIAL" ? 1 : (taskContext.turnCount ?? 0) + 1;
+        taskContext.consecutiveFailures = failures;
+        taskContext.turnCount = turns;
+
+        if (failures >= 3 || turns > 12) {
+          logger.warn({ requestId, taskId, sessionId, failures, turns }, "[Circuit Breaker] Aborting runaway task");
+          const stopPayload: ResponsePayload = {
+            task_id: taskId, session_id: sessionId, language_code: sessionLanguage,
+            execution_state: "COMPLETED", approach: "SAFETY_INTERCEPT",
+            speech_response: "I couldn't complete that. Please try again.",
+            action_type: "FINISH", target_text: "", package_name: "", text_to_type: "",
+            scroll_direction: "", execution_mode: "ACCESSIBILITY", error: "", is_completed: true,
+          };
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(stopPayload));
+          sessionContexts.delete(sessionId);
+          return;
         }
 
         const rawStatus = String(parsedMessage.status || parsedMessage.action_status || parsedMessage.actionStatus || "").toUpperCase();

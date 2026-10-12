@@ -27,6 +27,9 @@ class WebSocketManager(
     private val handler = Handler(Looper.getMainLooper())
     private var reconnectAttempt = 0
 
+    // Payloads that could not be sent while offline (only used when queueIfOffline = true)
+    private val pendingPayloads = mutableListOf<JSONObject>()
+
     fun connect() {
         shouldReconnect = true
         val request = Request.Builder().url(serverUrl).build()
@@ -36,6 +39,7 @@ class WebSocketManager(
                 reconnectAttempt = 0
                 Log.d("WebSocketManager", "Connected to Gateway-Core successfully!")
                 onConnectionStatusChanged(true)
+                flushPendingPayloads(webSocket)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -78,14 +82,92 @@ class WebSocketManager(
         }, delay)
     }
 
+    private fun flushPendingPayloads(socket: WebSocket) {
+        val toSend: List<JSONObject>
+        synchronized(pendingPayloads) {
+            toSend = pendingPayloads.toList()
+            pendingPayloads.clear()
+        }
+        if (toSend.isNotEmpty()) {
+            Log.d("WebSocketManager", "Flushing ${toSend.size} queued payload(s)")
+        }
+        toSend.forEach { socket.send(it.toString()) }
+    }
+
+    private fun purgePendingPayloads() {
+        synchronized(pendingPayloads) {
+            pendingPayloads.clear()
+        }
+    }
+
     // Send payload (e.g., user speech transcript or screen context) upstream to Service 01
-    fun sendPayload(payload: JSONObject, purgeQueue: Boolean = false): Boolean {
-        if (isConnected && webSocket != null) {
-            val result = webSocket!!.send(payload.toString())
-            Log.d("AccessibilityAgent", "PAYLOAD_SEND_RESULT:$result")
-            return result
-        } else {
-            Log.e("WebSocketManager", "Cannot send payload; socket is disconnected.")
+    fun sendPayload(payload: JSONObject, purgeQueue: Boolean = false, queueIfOffline: Boolean = true): Boolean {
+        if (purgeQueue) {
+            purgePendingPayloads()
+        }
+        try {
+            // Ensure session_id is present in all outgoing payloads
+            if (!payload.has("session_id")) {
+                payload.put("session_id", sessionManager.getSessionId())
+            }
+
+            val type = payload.optString("type")
+            // Ensure task_id is present for intent and feedback payloads (Step 1)
+            if (type == "USER_INTENT" || type == "USER_INTENT_FEEDBACK") {
+                if (!payload.has("task_id")) {
+                    payload.put("task_id", "")
+                }
+            }
+
+            // Pre-send guard: Do not send USER_INTENT if transcript or user_prompt is empty
+            if (type == "USER_INTENT") {
+                val transcript = payload.optString("transcript") // Match AccessibilityAgentService usage
+                if (transcript.isBlank()) {
+                    Log.w("WebSocketManager", "Aborting send: USER_INTENT has empty/blank transcript.")
+                    return false
+                }
+            }
+
+            // GUARD: If not connected, queue and trigger reconnect
+            if (webSocket == null || !isConnected) {
+                if (!queueIfOffline) {
+                    Log.w("WebSocketManager", "Offline; not queuing ${payload.optString("type")}")
+                    return false
+                }
+                Log.w("WebSocketManager", "Socket disconnected. Queuing payload: ${payload.optString("type")}")
+                synchronized(pendingPayloads) {
+                    if (pendingPayloads.size < 50) { // Safety limit for memory
+                        pendingPayloads.add(payload)
+                    }
+                }
+                if (shouldReconnect) scheduleReconnect()
+                return false
+            }
+
+            val success = webSocket?.send(payload.toString()) ?: false
+            if (!success) {
+                if (queueIfOffline) {
+                    Log.e("WebSocketManager", "Failed to send payload through socket. Queuing for retry.")
+                    synchronized(pendingPayloads) {
+                        pendingPayloads.add(payload)
+                    }
+                } else {
+                    Log.e("WebSocketManager", "Failed to send ${payload.optString("type")}; not queuing")
+                }
+            } else {
+                Log.d("WebSocketManager", "Payload sent successfully: ${payload.optString("type")}")
+            }
+            return success
+        } catch (e: Exception) {
+            if (queueIfOffline) {
+                Log.e("WebSocketManager", "Send error caught: ${e.message}. Payload queued for auto-retry.")
+                synchronized(pendingPayloads) {
+                    pendingPayloads.add(payload)
+                }
+            } else {
+                Log.e("WebSocketManager", "Send error for ${payload.optString("type")}: ${e.message}; not queuing")
+            }
+            isConnected = false
             return false
         }
     }

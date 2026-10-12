@@ -36,3 +36,7 @@ Thumbs.db
 
 # Docker
 *.log
+
+
+# Raw Android UI dumps
+/apps/mobile-android/dumps/

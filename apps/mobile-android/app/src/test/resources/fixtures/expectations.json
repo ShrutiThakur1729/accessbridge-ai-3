@@ -1,0 +1,20 @@
+{
+  "youtube_01_home":          { "ENTRY_OPENER": [27], "NAV_BAR": [79, 83, 87, 89, 94] },
+  "youtube_02_search_open":   { "ENTRY_FIELD":  [22] },
+  "youtube_03_results":       { "LIST_ITEM": [35], "PRICED_ITEM": [], "NAV_BAR": [114, 118, 122, 124, 129],
+    "NOT_NAV_BAR": [89, 107], "ADD": [], "COMMIT": [] },
+  "zepto_01_home":            { "ENTRY_OPENER": [180], "NAV_BAR": [234, 238, 242], "NOT_NAV_BAR": [105, 117] },
+  "zepto_02_search_open":     { "ENTRY_FIELD":  [104] },
+  "zepto_03_results":         { "LIST_ITEM": [34], "PRICED_ITEM": [34], "NOT_PRICED_ITEM": [304],
+    "ADD": [48, 104, 162, 179], "COMMIT": [] },
+  "zepto_04_cart":            { "COMMIT": [196, 203] },
+  "ola_01_home":              { "ENTRY_OPENER": [70] },
+  "ola_02_destination_entry": { "ENTRY_FIELD":  [49] },
+  "ola_03_result":            { "LIST_ITEM": [43], "PRICED_ITEM": [43], "NOT_PRICED_ITEM": [84], "COMMIT": [84] },
+  "ola_04_confirm_pickup":    { "COMMIT": [21] },
+  "ola_05_booked":            { "COMMIT": [] },
+  "whatsapp_01_home":         { "ENTRY_OPENER": [18], "PRICED_ITEM": [], "NAV_BAR": [158, 164, 169], "COMMIT": [] },
+  "whatsapp_02_search":       { "ENTRY_FIELD":  [20] },
+  "whatsapp_03_chat_open_Empty": { "NAV_BAR": [], "NOT_NAV_BAR": [77, 79, 80] },
+  "whatsapp_04_chat_open_typed": { "SEND": [72] }
+}
