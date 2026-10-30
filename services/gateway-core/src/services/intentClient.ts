@@ -32,6 +32,19 @@ export interface PlannerDirective {
   tap_y?: number;
 }
 
+export interface ExtractAppResult {
+  ok: boolean;
+  app_name: string | null;
+  task: string;
+  reason?: string | null;
+}
+
+export interface ClassifyReplyResult {
+  ok: boolean;
+  answer: "YES" | "NO" | "OTHER";
+  reason?: string | null;
+}
+
 export interface ActionHistoryEntry {
   action_type: string;
   target_node?: string;
@@ -118,6 +131,54 @@ export class IntentClient {
       throw error;
     } finally {
       taskLockManager.releaseLock(taskId, controller);
+    }
+  }
+  static async extractApp(transcript: string, requestId: string): Promise<ExtractAppResult> {
+    const rawUrl = String(ENV.INTENT_SAFETY_URL || "http://localhost:8000/api/v1").replace(/\/$/, "");
+    const base = rawUrl.endsWith("/plan") ? rawUrl.slice(0, -"/plan".length) : rawUrl;
+    const url = `${base}/extract-app`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 35000);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-ID": requestId },
+        body: JSON.stringify({ transcript }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`extract-app returned ${response.status}`);
+      }
+      return (await response.json()) as ExtractAppResult;
+    } catch (error) {
+      logger.warn({ requestId, error: (error as any)?.message || String(error) }, "App extraction failed");
+      return { ok: false, app_name: null, task: "", reason: `GATEWAY_ERROR: ${(error as any)?.message || "unknown"}` };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  static async classifyReply(question: string, reply: string, requestId: string): Promise<ClassifyReplyResult> {
+    const rawUrl = String(ENV.INTENT_SAFETY_URL || "http://localhost:8000/api/v1").replace(/\/$/, "");
+    const base = rawUrl.endsWith("/plan") ? rawUrl.slice(0, -"/plan".length) : rawUrl;
+    const url = `${base}/classify-reply`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 35000);
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Request-ID": requestId },
+        body: JSON.stringify({ question, reply }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`classify-reply returned ${response.status}`);
+      }
+      return (await response.json()) as ClassifyReplyResult;
+    } catch (error) {
+      logger.warn({ requestId, error: (error as any)?.message || String(error) }, "Reply classification failed");
+      return { ok: false, answer: "OTHER", reason: `GATEWAY_ERROR: ${(error as any)?.message || "unknown"}` };
+    } finally {
+      clearTimeout(timer);
     }
   }
 }

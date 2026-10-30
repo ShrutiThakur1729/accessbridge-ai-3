@@ -13,6 +13,10 @@ import kotlin.math.max
 
 object LauncherAppResolver {
     private const val TAG = "LauncherAppResolver"
+    private const val HIGH_CONFIDENCE = 0.85
+    private const val SUGGEST_MIN = 0.65
+    private const val PHONETIC_CAP = 0.80
+    
 
     enum class ResolutionStatus {
         MATCH_FOUND,
@@ -23,7 +27,14 @@ object LauncherAppResolver {
     sealed class LaunchGatingResult {
         data class SIMPLE_LAUNCH(val packageName: String, val appLabel: String, val componentName: ComponentName, val userHandle: UserHandle) : LaunchGatingResult()
         data class AMBIGUOUS_LAUNCH(val candidates: List<MatchCandidate>) : LaunchGatingResult()
-        data class COMPLEX_INTENT(val packageName: String, val leftoverText: String) : LaunchGatingResult()
+        data class SUGGEST_LAUNCH(val candidate: MatchCandidate) : LaunchGatingResult()
+        data class COMPLEX_INTENT(
+            val packageName: String,
+            val appLabel: String,
+            val componentName: ComponentName,
+            val userHandle: UserHandle,
+            val leftoverText: String
+        ) : LaunchGatingResult()
         object NO_LOCAL_MATCH : LaunchGatingResult()
     }
 
@@ -40,7 +51,7 @@ object LauncherAppResolver {
         return resolveApp(context, targetAppName, shouldLaunch)
     }
 
-    fun evaluateLaunchIntent(context: Context, rawTranscript: String): LaunchGatingResult {
+    fun evaluateLaunchIntent(context: Context, rawTranscript: String, allowSuggestions: Boolean = false): LaunchGatingResult {
         val launchVerbRegex = Regex("^(open|launch|start|go to|show me|run)\\s+", RegexOption.IGNORE_CASE)
         val cleanedTranscript = rawTranscript.replace(launchVerbRegex, "").trim()
         
@@ -54,7 +65,6 @@ object LauncherAppResolver {
         val userManager = context.getSystemService(Context.USER_SERVICE) as UserManager
         
         val candidatesList = mutableListOf<MatchCandidate>()
-        var bestScore = 0.0
 
         val profiles = userManager.userProfiles
         for (profile in profiles) {
@@ -71,33 +81,43 @@ object LauncherAppResolver {
                 
                 // Check Candidate 1
                 val score1 = computeSimilarity(candidate1.lowercase(), label)
-                if (score1 >= 0.70) {
+                if (score1 >= SUGGEST_MIN) {
                     candidatesList.add(MatchCandidate(score1, activity.componentName.packageName, activity.label.toString(), activity.componentName, profile, isManaged, candidate1))
-                    if (score1 > bestScore) bestScore = score1
                 }
 
                 // Check Candidate 2
                 if (candidate2.isNotEmpty()) {
                     val score2 = computeSimilarity(candidate2.lowercase(), label)
-                    if (score2 >= 0.70) {
+                    if (score2 >= SUGGEST_MIN) {
                         candidatesList.add(MatchCandidate(score2, activity.componentName.packageName, activity.label.toString(), activity.componentName, profile, isManaged, candidate2))
-                        if (score2 > bestScore) bestScore = score2
                     }
                 }
             }
         }
 
         if (candidatesList.isNotEmpty()) {
-            val highConfidenceThreshold = maxOf(0.90, bestScore - 0.05)
-            val topCandidates = candidatesList.filter { it.score >= highConfidenceThreshold }
+            val ranked = candidatesList
+                .sortedWith(
+                    compareByDescending<MatchCandidate> { it.score }
+                        .thenByDescending { it.matchedQueryPart?.length ?: 0 }   // tie-break: longer matched phrase wins
+                )
                 .distinctBy { "${it.packageName}_${it.userHandle}" }
-                .sortedByDescending { it.score }
 
-            if (topCandidates.size > 1) {
-                return LaunchGatingResult.AMBIGUOUS_LAUNCH(topCandidates.take(3))
+            val bestMatch = ranked.first()                            // safe: candidatesList is non-empty
+
+            if (bestMatch.score < HIGH_CONFIDENCE) {
+                if (allowSuggestions) {
+                    Log.d(TAG, "Suggesting '${bestMatch.label}' (score ${bestMatch.score}) for confirmation")
+                    return LaunchGatingResult.SUGGEST_LAUNCH(bestMatch)
+                }
+                Log.d(TAG, "Best '${bestMatch.label}' scored ${bestMatch.score} < $HIGH_CONFIDENCE; not auto-launching")
+                return LaunchGatingResult.NO_LOCAL_MATCH
             }
 
-            val bestMatch = topCandidates[0]
+            val closeCalls = ranked.filter { it.score >= maxOf(HIGH_CONFIDENCE, bestMatch.score - 0.05) }
+            if (closeCalls.size > 1) {
+                return LaunchGatingResult.AMBIGUOUS_LAUNCH(closeCalls.take(3))
+            }
             val leftoverText = cleanedTranscript.substring(bestMatch.matchedQueryPart?.length ?: 0).trim()
                 .replace(Regex("^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$"), "") // Trim punctuation
             
@@ -111,7 +131,10 @@ object LauncherAppResolver {
                     bestMatch.userHandle
                 )
             } else {
-                LaunchGatingResult.COMPLEX_INTENT(bestMatch.packageName, leftoverText)
+                LaunchGatingResult.COMPLEX_INTENT(
+                    bestMatch.packageName, bestMatch.label,
+                    bestMatch.componentName, bestMatch.userHandle, leftoverText
+                )
             }
         }
 
@@ -314,21 +337,18 @@ object LauncherAppResolver {
         val matchedQueryPart: String? = null
     )
 
-    private fun computeSimilarity(s1: String, s2: String): Double {
-        // Levenshtein Distance Ratio (0.0 to 1.0)
-        val levenshtein = levenshteinDistance(s1, s2)
+    private fun computeSimilarity(a: String, b: String): Double {
+        val s1 = a.filterNot { it.isWhitespace() }
+        val s2 = b.filterNot { it.isWhitespace() }
+
         val maxLength = max(s1.length, s2.length)
-        val editScore = if (maxLength == 0) 1.0 else 1.0 - (levenshtein.toDouble() / maxLength)
-        
-        // Phonetic Matching: Soundex
-        val s1Soundex = soundex(s1)
-        val s2Soundex = soundex(s2)
-        
-        // Exact Soundex match gives 1.0
-        val soundexMatch = if (s1Soundex == s2Soundex && s1Soundex.isNotEmpty()) 1.0 else 0.0
-        
-        // Combined Score = max(Levenshtein Ratio, Soundex Match Score)
-        return maxOf(editScore, soundexMatch)
+        val editScore = if (maxLength == 0) 1.0 else 1.0 - (levenshteinDistance(s1, s2).toDouble() / maxLength)
+
+        // Sounding alike can lift a score, but never to auto-launch level
+        val soundsAlike = s1.isNotEmpty() && soundex(s1) == soundex(s2)
+        val phoneticScore = if (soundsAlike) PHONETIC_CAP else 0.0
+
+        return maxOf(editScore, phoneticScore)
     }
 
     private fun soundex(s: String): String {

@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     # LLM Configuration fields
     GROQ_API_KEY: str = ""
     DEFAULT_LLM_MODEL: str = "llama3.1:8b"
+    EXTRACTION_MODEL: str = "llama3.2:3b"
+    CLASSIFY_MODEL: str = "llama3.2:3b"
     USE_LLM_MOCK: bool = False
     VISION_PERCEPTION_URL: str = "http://127.0.0.1:8010/api/v1"
     
