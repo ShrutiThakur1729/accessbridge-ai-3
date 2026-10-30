@@ -66,6 +66,7 @@ class AccessibilityAgentService : AccessibilityService() {
     var webSocketManager: WebSocketManager? = null
     var voiceAssistantManager: VoiceAssistantManager? = null
     private lateinit var sessionManager: SessionManager
+    private var floatingMic: FloatingMicController? = null
 
     private var currentSessionId: String? = null
     private var sessionResetJob: Job? = null
@@ -143,8 +144,11 @@ class AccessibilityAgentService : AccessibilityService() {
             },
             onSpeechStateChanged = { state ->
                 _speechState.value = state
+                floatingMic?.setState(state)
             }
         )
+
+        floatingMic = FloatingMicController(this) { onBubbleTapped() }.also { it.show() }
     }
 
     private fun handleServerReply(json: JSONObject) {
@@ -759,10 +763,16 @@ class AccessibilityAgentService : AccessibilityService() {
         sendPayload(feedback)
     }
 
+    private fun onBubbleTapped() {
+        val busy = (floatingMic?.state ?: "IDLE") != "IDLE" || currentTaskId != null
+        if (busy) handleUserCancel() else startAssistant()
+    }
+
     override fun onInterrupt() {}
 
     override fun onDestroy() {
         super.onDestroy()
+        floatingMic?.destroy()
         instance = null
         _serviceInstance.value = null
         serviceScope.cancel()

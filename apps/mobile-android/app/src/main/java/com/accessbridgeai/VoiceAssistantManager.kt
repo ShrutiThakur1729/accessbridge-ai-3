@@ -153,6 +153,12 @@ class VoiceAssistantManager(
 
     fun stopAllOperations() {
         isRecording = false
+        try {
+            speechRecognizer?.cancel()
+            speechRecognizer?.stopListening()
+        } catch (e: Exception) {
+            Log.e("VoiceManager", "Error stopping speech recognizer", e)
+        }
         mediaPlayer?.let {
             if (it.isPlaying) it.stop()
             it.release()
