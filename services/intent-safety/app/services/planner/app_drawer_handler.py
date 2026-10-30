@@ -12,34 +12,66 @@ from app.services.planner.entity_extractor import normalize_app_query
 
 APP_PACKAGE_HINTS = {
     "whatsapp": ("com.whatsapp", None, "WhatsApp"),
+    "व्हाट्सएप": ("com.whatsapp", None, "WhatsApp"),
+    "व्हाट्सॲप": ("com.whatsapp", None, "WhatsApp"),
     "uber": ("com.ubercab", None, "Uber"),
+    "उबर": ("com.ubercab", None, "Uber"),
     "hotstar": ("com.ripl.hotstar", "in.startv.hotstar", "Hotstar"),
     "jio hotstar": ("com.ripl.hotstar", "in.startv.hotstar", "Jio Hotstar"),
     "disney hotstar": ("com.ripl.hotstar", "in.startv.hotstar", "Disney Hotstar"),
+    "हॉटस्टार": ("com.ripl.hotstar", "in.startv.hotstar", "Hotstar"),
     "amazon": ("com.amazon.mShop.android.shopping", None, "Amazon"),
     "amazon shopping": ("com.amazon.mShop.android.shopping", None, "Amazon Shopping"),
+    "अमेझॉन": ("com.amazon.mShop.android.shopping", None, "Amazon"),
     "clock": ("com.google.android.deskclock", "com.sec.android.app.clockpackage", "Clock"),
     "alarm": ("com.google.android.deskclock", "com.sec.android.app.clockpackage", "Clock"),
+    "घड्याळ": ("com.google.android.deskclock", "com.sec.android.app.clockpackage", "Clock"),
+    "अलार्म": ("com.google.android.deskclock", "com.sec.android.app.clockpackage", "Clock"),
     "google maps": ("com.google.android.apps.maps", None, "Google Maps"),
     "maps": ("com.google.android.apps.maps", None, "Google Maps"),
+    "गूगल मॅप्स": ("com.google.android.apps.maps", None, "Google Maps"),
+    "मॅप्स": ("com.google.android.apps.maps", None, "Google Maps"),
     "bookmyshow": ("com.bt.bms", None, "BookMyShow"),
     "youtube": ("com.google.android.youtube", None, "YouTube"),
+    "यूट्यूब": ("com.google.android.youtube", None, "YouTube"),
+    "युट्युब": ("com.google.android.youtube", None, "YouTube"),
+    "युटूब": ("com.google.android.youtube", None, "YouTube"),
+    "यूट्यब": ("com.google.android.youtube", None, "YouTube"),
     "gmail": ("com.google.android.gm", None, "Gmail"),
+    "जीमेल": ("com.google.android.gm", None, "Gmail"),
     "chrome": ("com.android.chrome", None, "Chrome"),
+    "क्रोम": ("com.android.chrome", None, "Chrome"),
     "telegram": ("org.telegram.messenger", None, "Telegram"),
+    "टेलिग्राम": ("org.telegram.messenger", None, "Telegram"),
     "instagram": ("com.instagram.android", None, "Instagram"),
+    "इंस्टाग्राम": ("com.instagram.android", None, "Instagram"),
     "facebook": ("com.facebook.katana", None, "Facebook"),
+    "फेसबुक": ("com.facebook.katana", None, "Facebook"),
     "spotify": ("com.spotify.music", None, "Spotify"),
+    "स्पॉटिफाय": ("com.spotify.music", None, "Spotify"),
     "calendar": ("com.google.android.calendar", None, "Calendar"),
+    "कॅलेंडर": ("com.google.android.calendar", None, "Calendar"),
     "camera": ("com.google.android.GoogleCamera", None, "Camera"),
+    "कैमरा": ("com.google.android.GoogleCamera", None, "Camera"),
+    "कॅमेरा": ("com.google.android.GoogleCamera", None, "Camera"),
     "contacts": ("com.google.android.contacts", None, "Contacts"),
+    "कॉन्टेक्ट्स": ("com.google.android.contacts", None, "Contacts"),
+    "संपर्क": ("com.google.android.contacts", None, "Contacts"),
     "messages": ("com.google.android.apps.messaging", None, "Messages"),
+    "मैसेज": ("com.google.android.apps.messaging", None, "Messages"),
+    "संदेश": ("com.google.android.apps.messaging", None, "Messages"),
     "phone": ("com.google.android.dialer", None, "Phone"),
+    "फोन": ("com.google.android.dialer", None, "Phone"),
     "settings": ("com.android.settings", None, "Settings"),
+    "सेटिंग्स": ("com.android.settings", None, "Settings"),
     "blinkit": ("com.grofers.customerapp", "com.blinkit", "Blinkit"),
+    "ब्लिंकिट": ("com.grofers.customerapp", "com.blinkit", "Blinkit"),
     "savana": ("com.savana.android", "com.savana", "Savana"),
     "zepto": ("com.zepto.app", "com.zepto", "Zepto"),
+    "झिप्टो": ("com.zepto.app", "com.zepto", "Zepto"),
     "zomato": ("com.application.zomato", "com.zomato", "Zomato"),
+    "जोमैटो": ("com.application.zomato", "com.zomato", "Zomato"),
+    "झोमॅटो": ("com.application.zomato", "com.zomato", "Zomato"),
     "hungama": ("com.hungama.myplay.activity", "com.hungama", "Hungama"),
 }
 
@@ -50,17 +82,17 @@ EXCLUDED_LAUNCHER_UTILITY_TOKENS = (
 def resolve_app_launch(user_prompt: str) -> Optional[Tuple[Optional[str], Optional[str], str]]:
     normalized_prompt = user_prompt.lower()
     for app_name in sorted(APP_PACKAGE_HINTS, key=len, reverse=True):
-        if re.search(rf"\b{re.escape(app_name)}\b", normalized_prompt):
+        if app_name in normalized_prompt:
             return APP_PACKAGE_HINTS[app_name]
 
-    match = re.search(r"\b(?:open|launch|set|create|send|play|watch|find|on|in|using)\s+([a-zA-Z0-9\s]+)", user_prompt, re.IGNORECASE)
+    match = re.search(r"(?:open|launch|set|create|send|play|watch|find|on|in|using|kholo|chalao|ughda|chalu|lava|shuru)\s+(.+)", user_prompt, re.IGNORECASE)
     if match:
         raw_target = match.group(1).strip()
-        target_clause = re.split(r"\b(?:and|to|for|with|on|in|then|search|play|watch|find|buy|send)\b", raw_target, flags=re.IGNORECASE)[0].strip()
+        target_clause = re.split(r"\b(?:and|to|for|with|on|in|then|search|play|watch|find|buy|send|aur|aani|var|par|pe)\b", raw_target, flags=re.IGNORECASE)[0].strip()
         if target_clause:
             normalized_clause = target_clause.lower()
             for app_name in sorted(APP_PACKAGE_HINTS, key=len, reverse=True):
-                if re.search(rf"\b{re.escape(app_name)}\b", normalized_clause):
+                if app_name in normalized_clause:
                     return APP_PACKAGE_HINTS[app_name]
             extracted_label = " ".join(word.capitalize() for word in target_clause.split())
             return (None, None, extracted_label)
@@ -102,6 +134,29 @@ def is_app_foreground(current_app_package: Optional[str], user_prompt: str) -> b
             return True
     return False
 
+def is_compound_or_multi_step_intent(user_prompt: str) -> bool:
+    if not user_prompt:
+        return False
+    prompt_lower = user_prompt.lower().strip()
+    
+    # Check for compound conjunctions / connectors
+    connectors_pattern = r"\b(?:aur|and|then|phir|aani|for|in|on|using|with|to|pe|par|me|mein)\b"
+    # Check for action verbs / sub-task keywords
+    action_verbs_pattern = r"\b(?:search|play|watch|find|send|message|call|type|buy|lagao|laga|chalao|chala|dikhao|dikhayein|bajao|open|kholo|khol|ughada|lav)\b"
+
+    verb_matches = len(re.findall(action_verbs_pattern, prompt_lower))
+    has_connector = bool(re.search(connectors_pattern, prompt_lower))
+
+    app_info = resolve_app_launch(user_prompt)
+    if app_info and app_info[2]:
+        app_name = app_info[2].lower()
+        cleaned = re.sub(r"\b(?:open|launch|start|kholo|chalao|ughada|app|application|set|create|send|play|watch|find|show)\b", "", prompt_lower, flags=re.IGNORECASE).strip()
+        cleaned = cleaned.replace(app_name, "").strip()
+        if len(cleaned) > 2:
+            return True
+
+    return verb_matches >= 2 or has_connector
+
 def handle_app_drawer_recovery(
     user_prompt: str,
     screen_state: List[Dict[str, Any]],
@@ -116,6 +171,9 @@ def handle_app_drawer_recovery(
     session_states: Optional[Dict[str, str]] = None,
     pending_app_confirmations: Optional[Dict[str, str]] = None,
 ) -> Optional[ActionPlanResponse]:
+    if is_compound_or_multi_step_intent(user_prompt):
+        return None
+
     current_state = (session_states or {}).get(session_key, "")
 
     # =========================================================================

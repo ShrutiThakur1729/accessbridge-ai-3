@@ -3,6 +3,7 @@ package com.accessbridgeai.utils
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.util.Log
 import java.util.*
 import kotlin.math.max
 import kotlin.math.min
@@ -46,9 +47,25 @@ object AppResolver {
         }
     }
 
+    // Comprehensive multilingual launch & action verbs
+    private val ACTION_VERBS = setOf(
+        // English
+        "open", "launch", "start", "go to", "show me", "run", "play", "watch", "search", "find",
+        // Hindi / Hinglish
+        "kholo", "khol", "chalao", "chala", "lagao", "laga", "shuru karo", "dikhao", "dikhayein",
+        "open karo", "play karo", "chalu karo", "dekho", "bajao",
+        // Marathi
+        "ughada", "chalu kara", "dakhva", "lav", "pahawa"
+    )
+
+    // Conjunctions / Connectors that indicate compound sub-tasks
+    private val COMPOUND_CONNECTORS = setOf(
+        "aur", "and", "then", "phir", "aani", "par", "pe", "mein", "in", "on", "for"
+    )
+
     /**
      * Resolves an app from spoken input using phonetic matching and string similarity,
-     * accounting for multi-step intents.
+     * accounting for multilingual commands and multi-step compound intents.
      */
     fun resolveApp(context: Context, spokenInput: String): AppResolutionResult {
         val installedApps = getInstalledApps(context)
@@ -60,30 +77,64 @@ object AppResolver {
             return result
         }
 
-        // Check for launch verbs
-        val launchVerbRegex = Regex("^(open|launch|start|go to|show me|run)\\s+", RegexOption.IGNORE_CASE)
-        val inputWithoutVerb = cleanedInput.replace(launchVerbRegex, "").trim()
+        // Tokenize cleaned input
+        val tokens = cleanedInput.split(Regex("\\s+")).filter { it.isNotBlank() }
+
+        // Check if the input is a compound command
+        var isCompound = false
+        var verbCount = 0
+        for (token in tokens) {
+            if (COMPOUND_CONNECTORS.contains(token)) {
+                isCompound = true
+            }
+            if (ACTION_VERBS.contains(token)) {
+                verbCount++
+            }
+        }
+        if (verbCount >= 2) {
+            isCompound = true
+        }
+
+        // Extract target app query by stripping verbs
+        val inputTokensWithoutVerbs = tokens.filter { !ACTION_VERBS.contains(it) }
+        val inputWithoutVerb = inputTokensWithoutVerbs.joinToString(" ")
 
         val matches = mutableListOf<Pair<AppInfo, Double>>()
 
         for (app in installedApps) {
             val label = app.label.lowercase(Locale.ROOT)
+            val labelTokens = label.split(Regex("\\s+")).filter { it.isNotBlank() }
             
-            // 1. Direct Jaro-Winkler Similarity on input without verb
+            // 1. Exact string match
+            if (inputWithoutVerb == label || cleanedInput == label) {
+                matches.add(app to 1.0)
+                continue
+            }
+
+            // 2. Exact single-word token match against app label (e.g. "youtube" matches "youtube")
+            val tokenMatch = labelTokens.any { labelTok ->
+                inputTokensWithoutVerbs.contains(labelTok) || labelTok == inputWithoutVerb
+            }
+            val exactTokenScore = if (tokenMatch) 0.95 else 0.0
+
+            // 3. Jaro-Winkler Similarity
             val jwScore = jaroWinkler(inputWithoutVerb, label)
             
-            // 2. Phonetic Similarity (Double Metaphone)
-            val inputPhonetic = doubleMetaphone(inputWithoutVerb)
-            val labelPhonetic = doubleMetaphone(label)
+            // 4. Phonetic Similarity (Double Metaphone)
+            // SAFETY GUARD: DoubleMetaphone only applied if JW score is >= 0.60 to prevent collisions
+            // (e.g. "youtube kholo" -> "ATPK" matching "adobe acrobat" -> "ATPK")
+            val phoneticScore = if (jwScore >= 0.60) {
+                val inputPhonetic = doubleMetaphone(inputWithoutVerb)
+                val labelPhonetic = doubleMetaphone(label)
+                if (inputPhonetic.first == labelPhonetic.first && inputPhonetic.first.isNotEmpty()) 0.90 else 0.0
+            } else 0.0
+
+            // 5. Substring match boost
+            val substringScore = if (inputWithoutVerb.isNotEmpty() && (inputWithoutVerb.contains(label) || label.contains(inputWithoutVerb))) {
+                0.80
+            } else 0.0
             
-            val phoneticScore = if (inputPhonetic.first == labelPhonetic.first && inputPhonetic.first.isNotEmpty()) 0.95 else 0.0
-            val altPhoneticScore = if (inputPhonetic.second != null && labelPhonetic.second != null && 
-                inputPhonetic.second == labelPhonetic.second) 0.85 else 0.0
-            
-            // 3. Substring match boost
-            val substringScore = if (inputWithoutVerb.contains(label) || label.contains(inputWithoutVerb)) 0.7 else 0.0
-            
-            val finalScore = maxOf(jwScore, phoneticScore, altPhoneticScore, substringScore)
+            val finalScore = maxOf(exactTokenScore, jwScore, phoneticScore, substringScore)
             matches.add(app to finalScore)
         }
 
@@ -97,22 +148,23 @@ object AppResolver {
 
         val best = sortedMatches[0]
         
-        // Evaluate if leftover action tokens exist outside launch verbs and the app label
+        // Check for leftover non-verb, non-label tokens
         val bestLabelLower = best.first.label.lowercase(Locale.ROOT)
-        val tokensWithoutLabel = inputWithoutVerb.replace(bestLabelLower, "").trim()
-        
-        // If there are significant leftover tokens, it is a multi-step intent (e.g. "Play music on Spotify")
-        val hasLeftoverTokens = tokensWithoutLabel.isNotEmpty() && tokensWithoutLabel.any { it.isLetterOrDigit() }
+        val bestLabelTokens = bestLabelLower.split(Regex("\\s+"))
+        val leftoverTokens = inputTokensWithoutVerbs.filter { !bestLabelTokens.contains(it) }
+        val hasLeftoverTokens = leftoverTokens.isNotEmpty()
+
+        if (isCompound || hasLeftoverTokens) {
+            isCompound = true
+        }
 
         val confidence = when {
-            hasLeftoverTokens && best.second >= 0.60 -> Confidence.MULTI_STEP_INTENT
+            isCompound && best.second >= 0.50 -> Confidence.MULTI_STEP_INTENT
             best.second >= 0.85 -> Confidence.HIGH_CONFIDENCE
             best.second >= 0.60 -> Confidence.AMBIGUOUS
             else -> Confidence.NOT_INSTALLED
         }
 
-        // Always include the bestMatch packageName if the score is >= 0.60,
-        // even if it's a MULTI_STEP_INTENT.
         val result = AppResolutionResult(
             confidence = confidence,
             bestMatch = best.first,
@@ -120,7 +172,7 @@ object AppResolver {
             score = best.second,
             originalPrompt = spokenInput
         )
-        android.util.Log.d("AppResolver", "Resolution result: $result")
+        Log.d("AppResolver", "Resolution result for '$spokenInput': best='${best.first.label}' score=${best.second} confidence=$confidence")
         return result
     }
 

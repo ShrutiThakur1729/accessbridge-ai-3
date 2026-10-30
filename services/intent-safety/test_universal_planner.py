@@ -429,6 +429,20 @@ def test_strict_score_floor_discards_low_similarity_candidates():
     assert "The app 'Zomato' is not installed on your phone. Would you like me to install it from the Play Store?" in plan.speech_response
     assert planner_service._pending_install_intents.get(session_key).lower() == "zomato"
 
+def test_compound_hindi_intent_reaches_llm():
+    plan = asyncio.run(planner_service.generate_plan(
+        user_id="test_user",
+        task_id="compound_hindi_task",
+        user_prompt="youtube kholo aur tarak mehta ka ulta chashma lagao",
+        screen_state=[]
+    ))
+    assert plan is not None
+    assert len(plan.steps) > 0
+    assert plan.steps[0].action == ActionType.OPEN_APP
+    assert plan.steps[0].package_name == "com.google.android.youtube"
+    input_text = (plan.steps[0].input_data or plan.steps[0].target_text or "").lower()
+    assert "tarak mehta" in input_text or "taarak mehta" in input_text
+
 if __name__ == "__main__":
     test_system_prompt_contains_parameter_fulfillment_check()
     test_block_premature_save_on_turn_1_when_unadjusted_parameters_exist()
@@ -449,4 +463,5 @@ if __name__ == "__main__":
     test_ambiguous_app_match_confirmation_flow()
     test_dynamic_foreground_package_lock_guard()
     test_strict_score_floor_discards_low_similarity_candidates()
-    print("All unit tests (parameter fulfillment, loop detection, dynamic matching, Play Store flow, post-swipe protection, hard package lock, phonetic fuzzy matching, launcher utility filtering, intent metadata classification, pure launch termination, multi-step continuation, home-first recovery, ambiguous app confirmation, dynamic foreground package lock guard & strict score floor fallback) passed successfully!")
+    test_compound_hindi_intent_reaches_llm()
+    print("All unit tests (including compound Hindi intent Groq LLM reasoning) passed successfully!")

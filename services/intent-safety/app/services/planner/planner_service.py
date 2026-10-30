@@ -21,7 +21,7 @@ from app.services.planner.state_guards import (
 )
 from app.services.planner.app_drawer_handler import (
     resolve_app_launch, handle_app_drawer_recovery, extract_app_name_for_search, looks_like_launcher_or_app_drawer,
-    is_app_foreground
+    is_app_foreground, is_compound_or_multi_step_intent
 )
 from app.services.planner.llm_client import LLMPlannerClient
 from app.services.planner.localization import get_localized_message
@@ -596,7 +596,7 @@ class PlannerService:
                         reason="Foreground app guard: empty DOM while foregrounded, issuing SCROLL rescan wait.",
                     )]
                 ), "guard_empty_dom_foreground")
-            elif last_action != "SWIPE_UP":
+            elif last_action != "SWIPE_UP" and not is_compound_or_multi_step_intent(user_prompt):
                 app_info = resolve_app_launch(user_prompt)
                 if app_info and app_info[0]:
                     pkg, fallback_pkg, app_name = app_info

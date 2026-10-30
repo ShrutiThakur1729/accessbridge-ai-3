@@ -127,6 +127,8 @@ class AccessibilityAgentService : AccessibilityService() {
 
     fun startAssistant() {
         refreshSession()
+        val lang = sessionManager.selectedLanguage ?: "en"
+        voiceAssistantManager?.setLanguage(lang)
         voiceAssistantManager?.startListening()
     }
 
@@ -254,12 +256,10 @@ class AccessibilityAgentService : AccessibilityService() {
         serviceScope.launch {
             val resolution = AppResolver.resolveApp(this@AccessibilityAgentService, cleanIntent)
             
-            // Tier 1 & 2 Local App Resolver Interceptor
-            // AND MULTI_STEP_INTENT with a matched package
             val nativePackage = resolution.bestMatch?.packageName
-            if (nativePackage != null && (resolution.confidence == AppResolver.Confidence.HIGH_CONFIDENCE || 
-                resolution.confidence == AppResolver.Confidence.MULTI_STEP_INTENT)) {
-                
+
+            // Fast-path: ONLY single-intent HIGH_CONFIDENCE pure app launch requests (e.g. "open YouTube", "WhatsApp kholo")
+            if (nativePackage != null && resolution.confidence == AppResolver.Confidence.HIGH_CONFIDENCE) {
                 val pm = packageManager
                 val launchIntent = pm.getLaunchIntentForPackage(nativePackage)
                 if (launchIntent != null) {
@@ -272,57 +272,37 @@ class AccessibilityAgentService : AccessibilityService() {
                         
                         delay(1200) // Settlement delay
                         
-                        // If it's HIGH_CONFIDENCE, we stop here. 
-                        // If it's MULTI_STEP_INTENT, we continue to send to gateway.
-                        if (resolution.confidence == AppResolver.Confidence.HIGH_CONFIDENCE) {
-                            sendFeedbackAfterAction(
-                                result = ActionResult(true, "SUCCESS"),
-                                actionType = "OPEN_APP",
-                                targetPackage = nativePackage,
-                                intent = cleanIntent,
-                                isCompleted = true
-                            )
-                            return@launch
-                        }
+                        sendFeedbackAfterAction(
+                            result = ActionResult(true, "SUCCESS"),
+                            actionType = "OPEN_APP",
+                            targetPackage = nativePackage,
+                            intent = cleanIntent,
+                            isCompleted = true
+                        )
+                        return@launch
                     } catch (e: Exception) {
                         Log.e("AccessibilityAgent", "Local launch failed for $nativePackage", e)
                     }
                 }
             }
 
-            when (resolution.confidence) {
-                AppResolver.Confidence.HIGH_CONFIDENCE -> {
-                    // Handled above
-                }
-                AppResolver.Confidence.AMBIGUOUS -> {
-                    val candidateLabels = resolution.candidates.map { it.label }
-                    val speech = "Did you mean ${candidateLabels.joinToString(" or ")}?"
-                    voiceAssistantManager?.speak(speech)
-                    
-                    sendFeedbackAfterAction(
-                        result = ActionResult(false, "AMBIGUOUS_MATCH", candidates = candidateLabels),
-                        actionType = "OPEN_APP",
-                        intent = cleanIntent
-                    )
-                    return@launch
-                }
-                AppResolver.Confidence.NOT_INSTALLED -> {
-                    val appName = cleanIntent.replace(Regex("^(open|launch|start|go to|show me|run)\\s+", RegexOption.IGNORE_CASE), "").trim()
-                    val speech = "$appName is not installed. Download from Play Store?"
-                    voiceAssistantManager?.speak(speech)
-                    
-                    sendFeedbackAfterAction(
-                        result = ActionResult(false, "NOT_INSTALLED"),
-                        actionType = "OPEN_APP",
-                        intent = cleanIntent
-                    )
-                    return@launch
-                }
-                AppResolver.Confidence.MULTI_STEP_INTENT -> {
-                    Log.d("AccessibilityAgent", "Multi-step intent detected: $cleanIntent. Matched package: $nativePackage. Forwarding to gateway.")
-                }
+            if (resolution.confidence == AppResolver.Confidence.AMBIGUOUS) {
+                val candidateLabels = resolution.candidates.map { it.label }
+                val speech = "Did you mean ${candidateLabels.joinToString(" or ")}?"
+                voiceAssistantManager?.speak(speech)
+                
+                sendFeedbackAfterAction(
+                    result = ActionResult(false, "AMBIGUOUS_MATCH", candidates = candidateLabels),
+                    actionType = "OPEN_APP",
+                    intent = cleanIntent
+                )
+                return@launch
             }
 
+            // For MULTI_STEP_INTENT or NOT_INSTALLED or general intent:
+            // Capture screen state and forward full prompt directly to WebSocket Gateway / AI Planner for LLM reasoning
+            Log.d("AccessibilityAgent", "Forwarding intent to gateway: '$cleanIntent' (confidence=${resolution.confidence}, package_hint=$nativePackage)")
+            
             val screenState = captureScreenStateWithRetry()
             
             val payload = JSONObject().apply {
@@ -331,8 +311,9 @@ class AccessibilityAgentService : AccessibilityService() {
                 put("user_id", "default_user")
                 put("input_type", "TEXT")
                 put("session_id", sessionManager.getSessionId())
-                if (resolution.confidence == AppResolver.Confidence.MULTI_STEP_INTENT) {
-                    put("package_hint", resolution.bestMatch?.packageName)
+                put("session_language", sessionManager.selectedLanguage ?: "hi")
+                if (resolution.confidence == AppResolver.Confidence.MULTI_STEP_INTENT || nativePackage != null) {
+                    put("package_hint", nativePackage)
                 }
                 if (!currentTaskId.isNullOrEmpty()) {
                     put("task_id", currentTaskId)
