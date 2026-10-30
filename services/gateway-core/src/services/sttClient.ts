@@ -1,5 +1,6 @@
 import { ENV } from "../config/env.js";
 import { logger } from "../utils/logger.js";
+import { BhashiniClient } from "./bhashiniClient.js";
 
 export class SttError extends Error {
   constructor(public readonly code: "AUDIO_CORRUPT" | "AUDIO_SILENT" | "STT_UNAVAILABLE", message: string) {
@@ -28,59 +29,59 @@ function mapLanguageCode(rawLang: unknown): string | undefined {
   return undefined;
 }
 
-/** HTTP adapter for OpenAI's hosted Whisper STT endpoint. Audio stays in memory. */
+/** HTTP adapter for Speech-to-Text (Whisper primary, Bhashini fallback/multilingual) */
 export class SttClient {
-  static async transcribe(audio: Buffer, mimeType = "audio/webm"): Promise<SttResult> {
+  static async transcribe(audio: Buffer, mimeType = "audio/webm", targetLanguage = "hi"): Promise<SttResult> {
     if (audio.length < ENV.MIN_AUDIO_BYTES || audio.every((byte) => byte === 0)) {
       throw new SttError("AUDIO_SILENT", "Audio did not contain enough non-silent samples.");
     }
-    if (!ENV.STT_URL) {
-      throw new SttError("STT_UNAVAILABLE", "Speech-to-text service URL is not configured.");
-    }
-    if (!ENV.STT_API_KEY) {
-      logger.warn("STT_UNAVAILABLE: STT_API_KEY is not configured.");
-      throw new SttError("STT_UNAVAILABLE", "Speech-to-text service API key is not configured.");
-    }
 
-    const form = new FormData();
-    form.append("file", new Blob([audio], { type: mimeType }), "voice-input.webm");
-    form.append("model", ENV.STT_MODEL);
-    form.append("response_format", "verbose_json");
+    // Try Whisper primary if configured
+    if (ENV.STT_URL && ENV.STT_API_KEY) {
+      try {
+        const form = new FormData();
+        form.append("file", new Blob([audio], { type: mimeType }), "voice-input.webm");
+        form.append("model", ENV.STT_MODEL);
+        form.append("response_format", "verbose_json");
 
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${ENV.STT_API_KEY}`,
-    };
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${ENV.STT_API_KEY}`,
+        };
 
-    let response: Response;
-    try {
-      response = await fetch(ENV.STT_URL, {
-        method: "POST",
-        headers,
-        body: form,
-      });
-    } catch (error: any) {
-      throw new SttError("STT_UNAVAILABLE", `Unable to reach speech-to-text service: ${error?.message || error}`);
-    }
+        const response = await fetch(ENV.STT_URL, {
+          method: "POST",
+          headers,
+          body: form,
+        });
 
-    if (!response.ok) {
-      const detail = await response.text();
-      logger.warn({ status: response.status }, "STT engine rejected audio request");
-      throw new SttError("AUDIO_CORRUPT", "Speech-to-text service could not decode the audio.");
+        if (response.ok) {
+          const body = (await response.json()) as { text?: unknown; transcript?: unknown; language?: unknown; language_code?: unknown };
+          const transcript = String(body.text ?? body.transcript ?? "").trim();
+          if (transcript) {
+            const detectedLang = mapLanguageCode(body.language ?? body.language_code);
+            return { transcript, language: detectedLang };
+          }
+        }
+      } catch (err: any) {
+        logger.warn({ error: err?.message || err }, "Whisper STT primary failed; trying Bhashini ASR fallback");
+      }
     }
 
-    let body: { text?: unknown; transcript?: unknown; language?: unknown; language_code?: unknown };
-    try {
-      body = (await response.json()) as { text?: unknown; transcript?: unknown; language?: unknown; language_code?: unknown };
-    } catch {
-      throw new SttError("AUDIO_CORRUPT", "Speech-to-text service returned an invalid response.");
+    // Fallback: Bhashini ASR if configured
+    if (BhashiniClient.isConfigured()) {
+      try {
+        const bhashiniResult = await BhashiniClient.transcribeAudio(audio, targetLanguage);
+        if (bhashiniResult.transcript) {
+          return {
+            transcript: bhashiniResult.transcript,
+            language: bhashiniResult.detectedLanguage,
+          };
+        }
+      } catch (err: any) {
+        logger.warn({ error: err?.message || err }, "Bhashini ASR fallback failed");
+      }
     }
 
-    const transcript = String(body.text ?? body.transcript ?? "").trim();
-    if (!transcript) {
-      throw new SttError("AUDIO_SILENT", "No speech was detected in the audio.");
-    }
-
-    const detectedLang = mapLanguageCode(body.language ?? body.language_code);
-    return { transcript, language: detectedLang };
+    throw new SttError("STT_UNAVAILABLE", "Speech-to-text service is currently unavailable.");
   }
 }

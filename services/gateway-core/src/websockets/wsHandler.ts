@@ -6,6 +6,7 @@ import { logger } from "../utils/logger.js";
 import { ActionHistoryEntry, IntentClient, PlannerActionType, PlannerDirective, VisionClient } from "../services/intentClient.js";
 import { SttClient, SttError } from "../services/sttClient.js";
 import { getBlacklistMemory } from "../services/databricksClient.js";
+import { BhashiniClient } from "../services/bhashiniClient.js";
 
 export interface ResponsePayload {
   task_id: string;
@@ -15,6 +16,7 @@ export interface ResponsePayload {
   requires_confirmation?: boolean;
   approach: string;
   speech_response: string;
+  audio_response?: string;
   action_type: PlannerActionType;
   target_text: string;
   package_name: string;
@@ -758,6 +760,30 @@ const mergedBlacklist = Array.from(mergedBlacklistSet);
           tap_x: currentStep?.tap_x,
           tap_y: currentStep?.tap_y,
         };
+
+        // Attach Bhashini TTS audio response for supported Indic languages
+        const targetLang = responsePayload.language_code.toLowerCase().slice(0, 2);
+        if (
+          BhashiniClient.isConfigured() &&
+          responsePayload.speech_response &&
+          ENV.BHASHINI_TTS_LANGS.includes(targetLang)
+        ) {
+          try {
+            const ttsResult = await BhashiniClient.generateSpeech(
+              responsePayload.speech_response,
+              targetLang
+            );
+            if (ttsResult && ttsResult.audioBase64) {
+              responsePayload.audio_response = ttsResult.audioBase64;
+              logger.info(
+                { targetLang, speechLength: responsePayload.speech_response.length },
+                "Attached Bhashini TTS audio response to directive"
+              );
+            }
+          } catch (ttsErr: any) {
+            logger.warn({ error: ttsErr?.message || ttsErr }, "Bhashini TTS audio generation failed; falling back to device TTS");
+          }
+        }
 
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(responsePayload));

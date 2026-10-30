@@ -13,6 +13,7 @@ const crypto_1 = __importDefault(require("crypto"));
 const env_js_1 = require("./config/env.js");
 const logger_js_1 = require("./utils/logger.js");
 const wsHandler_js_1 = require("./websockets/wsHandler.js");
+const telemetryHandler_js_1 = require("./websockets/telemetryHandler.js");
 const app = (0, express_1.default)();
 const server = http_1.default.createServer(app);
 const wss = new ws_1.WebSocketServer({ server });
@@ -45,3 +46,7 @@ server.requestTimeout = 30000; // 30 seconds max to process client headers/paylo
 server.listen(env_js_1.ENV.PORT, () => {
     logger_js_1.logger.info(`Gateway-Core (Service 01) running on port ${env_js_1.ENV.PORT}`);
 });
+// ── Telemetry WebSocket Server (Databricks pipeline) ────────────────────
+const telemetryWss = new ws_1.WebSocketServer({ port: env_js_1.ENV.TELEMETRY_WS_PORT });
+(0, telemetryHandler_js_1.setupTelemetryWebSocket)(telemetryWss);
+logger_js_1.logger.info(`Telemetry WebSocket receiver listening on ws://0.0.0.0:${env_js_1.ENV.TELEMETRY_WS_PORT}`);

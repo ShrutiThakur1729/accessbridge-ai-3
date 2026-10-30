@@ -10,6 +10,8 @@ const env_js_1 = require("../config/env.js");
 const logger_js_1 = require("../utils/logger.js");
 const intentClient_js_1 = require("../services/intentClient.js");
 const sttClient_js_1 = require("../services/sttClient.js");
+const databricksClient_js_1 = require("../services/databricksClient.js");
+const bhashiniClient_js_1 = require("../services/bhashiniClient.js");
 class HybridPayloadError extends Error {
     code;
     constructor(code, message) {
@@ -206,6 +208,31 @@ function setupWebSocketServer(wss) {
                     return;
                 }
                 let parsedMessage = JSON.parse(message.toString());
+                // --- App extraction: a quick question to the AI, handled before any planner logic ---
+                if (String(parsedMessage.message_type || parsedMessage.type || "").toUpperCase() === "EXTRACT_APP") {
+                    const extraction = await intentClient_js_1.IntentClient.extractApp(String(parsedMessage.transcript || ""), requestId);
+                    if (ws.readyState === ws_1.WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            message_type: "APP_EXTRACTED",
+                            request_id: parsedMessage.request_id || "",
+                            ...extraction,
+                        }));
+                    }
+                    logger_js_1.logger.info({ requestId, ok: extraction.ok, app_name: extraction.app_name }, "App extraction relayed");
+                    return;
+                }
+                if (String(parsedMessage.message_type || parsedMessage.type || "").toUpperCase() === "CLASSIFY_REPLY") {
+                    const classification = await intentClient_js_1.IntentClient.classifyReply(String(parsedMessage.question || ""), String(parsedMessage.reply || ""), requestId);
+                    if (ws.readyState === ws_1.WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            message_type: "REPLY_CLASSIFIED",
+                            request_id: parsedMessage.request_id || "",
+                            ...classification,
+                        }));
+                    }
+                    logger_js_1.logger.info({ requestId, ok: classification.ok, answer: classification.answer }, "Reply classification relayed");
+                    return;
+                }
                 let audioBuffer;
                 let hybridPayload = false;
                 if (isHybridStart(parsedMessage)) {
@@ -345,6 +372,27 @@ function setupWebSocketServer(wss) {
                         status: actionStatus.toUpperCase(),
                     });
                 }
+                // --- Circuit breaker: stop runaway tasks ---
+                const statusUpper = actionStatus.toUpperCase();
+                const failures = (statusUpper === "FAILED" || statusUpper === "LOOP_DETECTED")
+                    ? (taskContext.consecutiveFailures ?? 0) + 1 : 0;
+                const turns = statusUpper === "INITIAL" ? 1 : (taskContext.turnCount ?? 0) + 1;
+                taskContext.consecutiveFailures = failures;
+                taskContext.turnCount = turns;
+                if (failures >= 3 || turns > 12) {
+                    logger_js_1.logger.warn({ requestId, taskId, sessionId, failures, turns }, "[Circuit Breaker] Aborting runaway task");
+                    const stopPayload = {
+                        task_id: taskId, session_id: sessionId, language_code: sessionLanguage,
+                        execution_state: "COMPLETED", approach: "SAFETY_INTERCEPT",
+                        speech_response: "I couldn't complete that. Please try again.",
+                        action_type: "FINISH", target_text: "", package_name: "", text_to_type: "",
+                        scroll_direction: "", execution_mode: "ACCESSIBILITY", error: "", is_completed: true,
+                    };
+                    if (ws.readyState === ws_1.WebSocket.OPEN)
+                        ws.send(JSON.stringify(stopPayload));
+                    sessionContexts.delete(sessionId);
+                    return;
+                }
                 const rawStatus = String(parsedMessage.status || parsedMessage.action_status || parsedMessage.actionStatus || "").toUpperCase();
                 if (rawStatus === "LOOP_DETECTED" || String(actionStatus).toUpperCase() === "LOOP_DETECTED") {
                     const actionType = String(executedAction || parsedMessage.action_type || parsedMessage.action || "SCROLL").trim();
@@ -403,7 +451,7 @@ function setupWebSocketServer(wss) {
                         };
                         if (ws.readyState === ws_1.WebSocket.OPEN) {
                             ws.send(JSON.stringify(responsePayload));
-                            sessionContexts.delete(sessionId);
+                            logger_js_1.logger.info({ requestId, taskId, sessionId, responsePayload }, "Sent AI planner directive to Android");
                         }
                         return;
                     }
@@ -427,6 +475,7 @@ function setupWebSocketServer(wss) {
                         };
                         if (ws.readyState === ws_1.WebSocket.OPEN) {
                             ws.send(JSON.stringify(responsePayload));
+                            logger_js_1.logger.info({ requestId, taskId, sessionId, responsePayload }, "Sent AI planner directive to Android");
                         }
                         return;
                     }
@@ -469,6 +518,42 @@ function setupWebSocketServer(wss) {
                     visionElementsCount: visionElements.length,
                     screenshotPresent: Boolean(screenshotBase64),
                 }, "Compressed screen state and querying Python AI Planner");
+                // ── Merge persisted Databricks failure history into blacklist ────
+                // Cached per session per package, with a TTL, to avoid hitting Databricks
+                // on every single WebSocket message (which would add real latency to
+                // every user action, especially on a cold serverless warehouse).
+                const BLACKLIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+                const cache = taskContext.databricksBlacklistCache;
+                const cacheIsFresh = cache &&
+                    cache.packageName === currentPackageName &&
+                    Date.now() - cache.fetchedAt < BLACKLIST_CACHE_TTL_MS;
+                let databricksBlacklist;
+                if (cacheIsFresh) {
+                    databricksBlacklist = cache.entries;
+                }
+                else {
+                    // getBlacklistMemory() never throws — returns [] on failure/unconfigured
+                    databricksBlacklist = await (0, databricksClient_js_1.getBlacklistMemory)(userId, currentPackageName);
+                    taskContext.databricksBlacklistCache = {
+                        packageName: currentPackageName,
+                        entries: databricksBlacklist,
+                        fetchedAt: Date.now(),
+                    };
+                }
+                const mergedBlacklistSet = new Set([
+                    ...taskContext.blacklistMemory,
+                    ...databricksBlacklist,
+                ]);
+                const mergedBlacklist = Array.from(mergedBlacklistSet);
+                if (databricksBlacklist.length > 0) {
+                    logger_js_1.logger.info({
+                        requestId,
+                        taskId,
+                        clientEntries: taskContext.blacklistMemory.length,
+                        databricksEntries: databricksBlacklist.length,
+                        mergedTotal: mergedBlacklist.length,
+                    }, "Merged Databricks failure history into blacklist_memory");
+                }
                 const aiPlan = await intentClient_js_1.IntentClient.evaluateIntent({
                     user_id: userId,
                     task_id: taskId,
@@ -492,7 +577,7 @@ function setupWebSocketServer(wss) {
                     screenshot_base64: screenshotBase64 || undefined,
                     vision_elements: visionElements,
                     action_history: taskContext.actionHistory,
-                    blacklist_memory: taskContext.blacklistMemory,
+                    blacklist_memory: mergedBlacklist,
                 }, requestId);
                 const currentStepIndex = aiPlan.current_step_index || 0;
                 const currentStep = aiPlan.steps && aiPlan.steps.length > currentStepIndex ? aiPlan.steps[currentStepIndex] : null;
@@ -507,7 +592,7 @@ function setupWebSocketServer(wss) {
                 const responsePayload = {
                     task_id: taskId,
                     session_id: sessionId,
-                    language_code: normalizeLanguage(aiPlan.session_language, sessionLanguage),
+                    language_code: normalizeLanguage(aiPlan.response_language || aiPlan.session_language, sessionLanguage),
                     execution_state: isHardStop ? "ERROR" : aiPlan.execution_state || "EXECUTING",
                     requires_confirmation: aiPlan.requires_confirmation,
                     approach: isHardStop ? "SAFETY_INTERCEPT" : aiPlan.approach || "SERVER_REPLANNING",
@@ -529,6 +614,22 @@ function setupWebSocketServer(wss) {
                     tap_x: currentStep?.tap_x,
                     tap_y: currentStep?.tap_y,
                 };
+                // Attach Bhashini TTS audio response for supported Indic languages
+                const targetLang = responsePayload.language_code.toLowerCase().slice(0, 2);
+                if (bhashiniClient_js_1.BhashiniClient.isConfigured() &&
+                    responsePayload.speech_response &&
+                    env_js_1.ENV.BHASHINI_TTS_LANGS.includes(targetLang)) {
+                    try {
+                        const ttsResult = await bhashiniClient_js_1.BhashiniClient.generateSpeech(responsePayload.speech_response, targetLang);
+                        if (ttsResult && ttsResult.audioBase64) {
+                            responsePayload.audio_response = ttsResult.audioBase64;
+                            logger_js_1.logger.info({ targetLang, speechLength: responsePayload.speech_response.length }, "Attached Bhashini TTS audio response to directive");
+                        }
+                    }
+                    catch (ttsErr) {
+                        logger_js_1.logger.warn({ error: ttsErr?.message || ttsErr }, "Bhashini TTS audio generation failed; falling back to device TTS");
+                    }
+                }
                 if (ws.readyState === ws_1.WebSocket.OPEN) {
                     ws.send(JSON.stringify(responsePayload));
                     logger_js_1.logger.info({ requestId, taskId, sessionId, responsePayload }, "Sent AI planner directive to Android");

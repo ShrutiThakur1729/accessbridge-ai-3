@@ -21,4 +21,11 @@ export const ENV = {
   TELEMETRY_WS_PORT: process.env.TELEMETRY_WS_PORT
     ? parseInt(process.env.TELEMETRY_WS_PORT, 10)
     : 3001,
+
+  // Bhashini API Configuration
+  BHASHINI_API_KEY: process.env.BHASHINI_API_KEY || "",
+  BHASHINI_UDYAT_KEY: process.env.BHASHINI_UDYAT_KEY || "",
+  BHASHINI_URL: process.env.BHASHINI_URL || "https://dhruva-api.bhashini.gov.in/services/inference/pipeline",
+  BHASHINI_TIMEOUT_MS: process.env.BHASHINI_TIMEOUT_MS ? parseInt(process.env.BHASHINI_TIMEOUT_MS, 10) : 10000,
+  BHASHINI_TTS_LANGS: (process.env.BHASHINI_TTS_LANGS || "hi,mr").split(",").map((s) => s.trim().toLowerCase()),
 };
